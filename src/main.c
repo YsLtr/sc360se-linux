@@ -20,7 +20,8 @@ static void usage(const char *p)
 "               (cpi snaps to 100 below 5000, to 500 at/above 5000)\n"
 "  %s color     <stage 0-5> <#RRGGBB>\n"
 "  %s sleep     <seconds>\n"
-"  %s commit\n"
+"  %s static-light             restore static DPI LED mode\n"
+"  %s commit                   alias for static-light\n"
 "  %s factory-reset              restore firmware defaults (repairs inert DPI key)\n"
 "\n"
 "Profiles (host-side; switching = rewrite full config):\n"
@@ -44,7 +45,7 @@ static void usage(const char *p)
 "  %s recv      [timeout-ms]\n"
 "  %s monitor\n"
 "  %s watch     monitor decoded battery & DPI events\n",
-    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
+    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
 }
 
 static int hex_to_byte(const char *s, uint8_t *out)
@@ -180,9 +181,8 @@ static int do_dpi(struct sc360se_device *dev, int argc, char **argv)
         int y = slash ? atoi(slash + 1) : x;
         c.stage[i].x_cpi = (uint16_t)x;
         c.stage[i].y_cpi = (uint16_t)y;
-        /* flag=0xff so the LED stays on for this stage. flag=0x00 keeps
-         * the firmware's stored color but with the LED disabled — that's
-         * almost never what a user invoking `sc360se dpi` wants.        */
+        /* Color flags are not part of the 0x03 DPI frame; static LED
+         * restoration is performed by sc360se_set_dpi() after the write. */
         c.stage[i].flag = 0xff;
     }
     return sc360se_set_dpi(dev, &c);
@@ -385,6 +385,7 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "sleep") && argc == 3)
         r = sc360se_set_sleep_seconds(&dev, (uint16_t)atoi(argv[2]));
     else if (!strcmp(cmd, "button"))  r = do_button(&dev, argc, argv);
+    else if (!strcmp(cmd, "static-light")) r = sc360se_set_static_light(&dev);
     else if (!strcmp(cmd, "commit"))  r = sc360se_commit(&dev);
     else if (!strcmp(cmd, "factory-reset")) r = sc360se_factory_reset(&dev);
     else if (!strcmp(cmd, "apply") && argc == 3) {

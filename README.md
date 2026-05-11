@@ -27,14 +27,14 @@ against 9 captured frames (run `make test`).
 | Sleep timeout | ✅ | wireshark_catch1 |
 | Button mapping (5 safe slots + locked DPI key) | ✅ | side / wheel / DPI key captures |
 | Factory reset (op 0x0f) | ✅ | DPI配置.pcapng |
-| Commit / save profile (op 0x06) | ⚠ partial | exact semantics unclear |
+| Static DPI light restore (op 0x06) | ✅ | live test + profile captures |
 | Profile switching | ✅ | host-side rewrite of full config |
 
 ## Build & install
 
 ```sh
 make
-make test          # run protocol unit tests (12/12)
+make test          # run protocol unit tests
 sudo make install  # CLI + udev rule
 sudo make install-gui  # CLI + udev + Python/GTK4 GUI + .desktop entry
 sudo udevadm control --reload && sudo udevadm trigger --action=add --subsystem-match=hidraw
@@ -52,7 +52,7 @@ sc360se-gui
 
 A single-window app:
 
-- **Header bar** — refresh status, *Commit*, *Apply to mouse* (suggested action)
+- **Header bar** — refresh status, restore static light, *Apply to mouse* (suggested action)
 - **Profile bar** — dropdown of saved profiles with Load / Save as / Delete
 - **DPI section** — active-stage selector, count spinner, 6 rows of
   spin + slider + color picker (sliders snap to 100/500 cpi)
@@ -85,7 +85,7 @@ sc360se button 4 disable
 sc360se button 4 key 0x06 mod=ctrl         # Ctrl+C (HID usage 0x06)
 sc360se button 4 consumer 0xe9             # Volume Up
 
-sc360se commit                             # flush to flash
+sc360se static-light                       # restore constant DPI LED mode
 
 # Low-level
 sc360se send  09 00 01 0f 10 01 00 ...     # auto-checksums
@@ -109,8 +109,8 @@ sc360se watch                              # decoded battery & DPI events
 |-----|-----|----------|-------------------|
 | 0x02 | 0x01 | polling rate | [4]: 1=1000Hz 2=500 4=250 8=125 |
 | 0x03 | 0x25 | DPI config | [4]=(active<<4)\|count; [5..28]=6×(X u16, Y u16), value=cpi/100 |
-| 0x04 | 0x12 | DPI colors | [4..21]=6×(R G B); [22..27]=6×flag (0xff=LED on) |
-| 0x06 | 0x05 | commit / save | [4]=01, [6]=01 |
+| 0x04 | 0x12 | DPI colors | [4..21]=6×(R G B); [22..27]=6×stored flag bytes (0x00 in static-light captures) |
+| 0x06 | 0x05 | static DPI light mode | [4]=02 restores constant DPI LED after host-side DPI writes |
 | 0x07 | 0x04 | sleep timeout | [4..5]=u16 LE seconds; [7]=0x08 |
 | 0x09 | 0x0f | button mapping | 6 slots × 3 bytes (type, p1, p2); slot 5 is locked safe |
 | 0x0f | 0x01 | factory reset | [4]=ff; also clears hidden DPI-key remap state |
@@ -153,7 +153,7 @@ The Windows driver is **not "stripped down"** — it just exposes
 everything the firmware actually accepts. After exhaustive captures we
 found *no command at all* for:
 
-- LED mode / effect (only the per-stage DPI color array exists)
+- full LED effect editing (only static DPI-light restore is implemented)
 - LED brightness
 - LOD (lift-off distance)
 - Button debounce

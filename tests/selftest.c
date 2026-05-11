@@ -168,12 +168,12 @@ int main(void)
     check("Profile 3 (Office) DPI",
           f, "03000125230a000a00140014001e001e0020002000320032003c003c000000b7");
 
-    /* Commit marker as the GUI sends it during a profile switch */
+    /* Static DPI light restore — verified live after host-side DPI writes */
     memset(f, 0, sizeof(f));
-    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x01; f[6]=0x01;
+    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x02;
     f[31] = sc360se_checksum(f);
-    check("commit (op 0x06)",
-          f, "0600010501000100000000000000000000000000000000000000000000000002");
+    check("static DPI light (op 0x06)",
+          f, "0600010502000000000000000000000000000000000000000000000000000002");
 
     /* Factory reset — from DPI配置.pcapng frame #9955 / #33257 */
     memset(f, 0, sizeof(f));

@@ -111,7 +111,15 @@ int sc360se_set_dpi(struct sc360se_device *dev,
         f[5 + i*4 + 2] = (uint8_t)(y & 0xff);
         f[5 + i*4 + 3] = (uint8_t)(y >> 8);
     }
-    return sc360se_send(dev, f);
+
+    int rc = sc360se_send(dev, f);
+    if (rc < 0) return rc;
+
+    /* Host-side 0x03 DPI writes update the stored active stage but do not
+     * run the firmware's physical-DPI-key path. Live testing showed that
+     * the LED leaves static mode until the Windows static-light frame is
+     * sent again. */
+    return sc360se_set_static_light(dev);
 }
 
 /* ------------------------------------------------------------------ */
@@ -123,9 +131,9 @@ int sc360se_set_dpi(struct sc360se_device *dev,
 /* shows the RGB block first (Red,Green,Blue,Magenta,Yellow,Cyan for  */
 /* factory defaults), followed by 6 independent flag bytes.           */
 /*                                                                    */
-/* The flag byte is the "LED enabled" bit for the stage:              */
-/*   0xff = LED shows this color when this stage is active            */
-/*   0x00 = LED stays OFF when this stage is active                   */
+/* The six trailing flag bytes are stored by the firmware. Captures of */
+/* normal static DPI lighting use 0x00 for every stage; restoring the  */
+/* live LED state is handled by the separate 0x06 static-light frame.  */
 /* ------------------------------------------------------------------ */
 
 int sc360se_set_dpi_colors(struct sc360se_device *dev,
@@ -189,21 +197,24 @@ int sc360se_set_buttons(struct sc360se_device *dev,
 }
 
 /* ------------------------------------------------------------------ */
-/* Commit / save profile  (op 0x06, sub 0x05)                         */
+/* Static DPI light mode  (op 0x06, sub 0x05)                         */
 /*                                                                    */
-/* Sent by the Windows driver after every write to flush settings.    */
-/* Payload byte [4] varies (0x01, 0x02 observed) — exact semantics    */
-/* not pinned down; sending 0x01 0x00 0x01 0x00 (the value seen       */
-/* during the profile-switch readback sequence) appears safe.         */
+/* Windows sends this after profile writes. Live testing showed that   */
+/* host-side DPI writes (0x03) make the LED leave static mode, while   */
+/* this exact payload restores the constant DPI LED.                   */
 /* ------------------------------------------------------------------ */
 
-int sc360se_commit(struct sc360se_device *dev)
+int sc360se_set_static_light(struct sc360se_device *dev)
 {
     uint8_t f[SC360SE_FRAME_LEN];
     frame_init(f, 0x06, 0x01, 0x05);
-    f[4] = 0x01;
-    f[6] = 0x01;
+    f[4] = 0x02;
     return sc360se_send(dev, f);
+}
+
+int sc360se_commit(struct sc360se_device *dev)
+{
+    return sc360se_set_static_light(dev);
 }
 
 /* ------------------------------------------------------------------ */

@@ -137,6 +137,7 @@ int sc360se_set_dpi(struct sc360se_device *dev,
                     const struct sc360se_dpi_config *cfg);
 int sc360se_set_dpi_colors(struct sc360se_device *dev,
                            const struct sc360se_dpi_config *cfg);
+int sc360se_set_static_light(struct sc360se_device *dev);
 int sc360se_set_sleep_seconds(struct sc360se_device *dev, uint16_t seconds);
 int sc360se_set_buttons(struct sc360se_device *dev,
                         const struct sc360se_button_action acts[SC360SE_NBUTTONS]);

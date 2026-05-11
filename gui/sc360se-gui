@@ -588,8 +588,8 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         led_chk = Gtk.CheckButton(label="LED")
         led_chk.set_tooltip_text(
-            "When this stage is active, light the LED with the chosen color "
-            "(flag=0xff). Uncheck to keep the LED dark on this stage.")
+            "Store this stage's DPI color flag. Static LED mode is restored "
+            "separately after device writes.")
         def on_led(_w):
             if not self._guard:
                 self.profile.stages[i].flag = 0xff if led_chk.get_active() else 0x00
@@ -1121,7 +1121,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             parts.append(f"{s.x_cpi}/{s.y_cpi}")
         debug("WRITE dpi: " + " ".join(parts))
         run_cli(self.cli, "dpi", *parts, timeout=5)
-        run_cli(self.cli, "commit")
+        run_cli(self.cli, "static-light")
 
     def _write_colors(self):
         if not self._write_allowed("colors"):
@@ -1133,7 +1133,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             parts.append(f"{r:02x}/{g:02x}/{b:02x}/{s.flag:02x}")
         debug("WRITE colors: " + " ".join(parts))
         run_cli(self.cli, "write-colors", *parts, timeout=5)
-        run_cli(self.cli, "commit")
+        run_cli(self.cli, "static-light")
 
     def _write_buttons(self):
         if not self._write_allowed("buttons"):
@@ -1144,21 +1144,21 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             parts.append(f"{tc:02x}/{b.p1:02x}/{b.p2:02x}")
         debug("WRITE buttons: " + " ".join(parts))
         run_cli(self.cli, "write-buttons", *parts, timeout=5)
-        run_cli(self.cli, "commit")
+        run_cli(self.cli, "static-light")
 
     def _write_polling(self):
         if not self._write_allowed("polling"):
             return
         debug(f"WRITE polling: {self.profile.polling}")
         run_cli(self.cli, "polling", str(self.profile.polling))
-        run_cli(self.cli, "commit")
+        run_cli(self.cli, "static-light")
 
     def _write_sleep(self):
         if not self._write_allowed("sleep"):
             return
         debug(f"WRITE sleep: {self.profile.sleep_seconds}")
         run_cli(self.cli, "sleep", str(self.profile.sleep_seconds))
-        run_cli(self.cli, "commit")
+        run_cli(self.cli, "static-light")
 
     def do_factory_reset(self):
         dlg = Gtk.AlertDialog()
