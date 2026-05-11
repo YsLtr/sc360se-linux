@@ -1,0 +1,4 @@
+*.o
+/sc360se
+/tests/selftest
+__pycache__/

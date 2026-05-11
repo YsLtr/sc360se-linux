@@ -1,0 +1,9 @@
+# AULA SC360SE — wired
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", \
+  ATTRS{idVendor}=="248a", ATTRS{idProduct}=="5d2e", \
+  TAG+="uaccess"
+
+# AULA SC360SE — 2.4G dongle
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", \
+  ATTRS{idVendor}=="249a", ATTRS{idProduct}=="5c2f", \
+  TAG+="uaccess"

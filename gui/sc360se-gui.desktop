@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AULA SC360SE
+Comment=Configure the AULA SC360SE wireless mouse
+Exec=sc360se-gui
+Icon=input-mouse
+Categories=Settings;HardwareSettings;
+Terminal=false
+StartupNotify=true
+Keywords=mouse;dpi;rgb;gaming;

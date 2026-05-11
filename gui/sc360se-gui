@@ -1,0 +1,1035 @@
+#!/usr/bin/env python3
+"""
+sc360se-gui — GTK4 frontend for the AULA SC360SE driver.
+
+Talks to the device by spawning the `sc360se` CLI binary from this
+directory (or from $PATH). Profile files use the same INI format the
+C driver reads/writes, so CLI and GUI can share configs.
+"""
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib, Gio
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI wrapper
+# ─────────────────────────────────────────────────────────────────────
+
+HERE = Path(__file__).resolve().parent
+
+def find_cli() -> Path:
+    local = HERE / "sc360se"
+    if local.exists() and os.access(local, os.X_OK):
+        return local
+    sys_ = shutil.which("sc360se")
+    if sys_:
+        return Path(sys_)
+    raise FileNotFoundError("sc360se binary not found (build it first or add to PATH)")
+
+class CliError(RuntimeError):
+    pass
+
+def run_cli(cli: Path, *args, timeout=15) -> str:
+    try:
+        r = subprocess.run([str(cli), *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise CliError(f"timeout running: sc360se {' '.join(args)}") from e
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "unknown error").strip()
+        raise CliError(msg)
+    return r.stdout
+
+# ─────────────────────────────────────────────────────────────────────
+# Profile data model — mirrors src/profile.c on disk format
+# ─────────────────────────────────────────────────────────────────────
+
+POLLING_RATES = [125, 250, 500, 1000]
+NSTAGES = 6
+NBUTTONS = 6
+
+BUTTON_LABELS = [
+    "Left",
+    "Right",
+    "Wheel",
+    "Back side",
+    "Front side",
+    "DPI key",
+]
+
+ACTION_TYPES = [
+    ("mouse",    "Mouse button"),
+    ("dpi",      "DPI control"),
+    ("disable",  "Disabled"),
+    ("key",      "Keyboard key"),
+    ("consumer", "Media key"),
+]
+
+MOUSE_BUTTONS = [(0x01, "Left"), (0x02, "Right"), (0x04, "Middle"),
+                 (0x08, "Forward"), (0x10, "Back")]
+
+DPI_ACTIONS = [(0x01, "Cycle"), (0x02, "DPI +"), (0x03, "DPI −")]
+
+# A small, useful subset of HID keyboard usages — extend as needed.
+HID_KEYS = [
+    (0x04, "A"), (0x05, "B"), (0x06, "C"), (0x07, "D"), (0x08, "E"),
+    (0x09, "F"), (0x0a, "G"), (0x0b, "H"), (0x0c, "I"), (0x0d, "J"),
+    (0x0e, "K"), (0x0f, "L"), (0x10, "M"), (0x11, "N"), (0x12, "O"),
+    (0x13, "P"), (0x14, "Q"), (0x15, "R"), (0x16, "S"), (0x17, "T"),
+    (0x18, "U"), (0x19, "V"), (0x1a, "W"), (0x1b, "X"), (0x1c, "Y"),
+    (0x1d, "Z"),
+    (0x1e, "1"), (0x1f, "2"), (0x20, "3"), (0x21, "4"), (0x22, "5"),
+    (0x23, "6"), (0x24, "7"), (0x25, "8"), (0x26, "9"), (0x27, "0"),
+    (0x28, "Enter"), (0x29, "Esc"), (0x2a, "Backspace"), (0x2b, "Tab"),
+    (0x2c, "Space"),
+    (0x3a, "F1"), (0x3b, "F2"), (0x3c, "F3"), (0x3d, "F4"),
+    (0x3e, "F5"), (0x3f, "F6"), (0x40, "F7"), (0x41, "F8"),
+    (0x42, "F9"), (0x43, "F10"), (0x44, "F11"), (0x45, "F12"),
+]
+
+CONSUMER_KEYS = [
+    (0x00b5, "Next track"),
+    (0x00b6, "Prev track"),
+    (0x00cd, "Play/Pause"),
+    (0x00e2, "Mute"),
+    (0x00e9, "Vol +"),
+    (0x00ea, "Vol −"),
+    (0x006f, "Brightness +"),
+    (0x0070, "Brightness −"),
+    (0x0192, "Calculator"),
+]
+
+KBD_MODS = [
+    (0x01, "LCtrl"),  (0x02, "LShift"), (0x04, "LAlt"),  (0x08, "LGUI"),
+    (0x10, "RCtrl"),  (0x20, "RShift"), (0x40, "RAlt"),  (0x80, "RGUI"),
+]
+
+@dataclass
+class Stage:
+    x_cpi: int = 1600
+    y_cpi: int = 1600
+    rgb: str = "#FFFFFF"
+    flag: int = 0xff
+
+@dataclass
+class Button:
+    type: str = "mouse"
+    p1: int = 0
+    p2: int = 0
+
+@dataclass
+class Profile:
+    polling: int = 1000
+    sleep_seconds: int = 90
+    dpi_active: int = 0
+    dpi_count: int = 5
+    stages: list = field(default_factory=lambda: [Stage() for _ in range(NSTAGES)])
+    buttons: list = field(default_factory=lambda: [
+        Button("mouse", 0x01, 0), Button("mouse", 0x02, 0),
+        Button("mouse", 0x04, 0), Button("mouse", 0x08, 0),
+        Button("mouse", 0x10, 0), Button("dpi", 0x01, 0),
+    ])
+
+    @classmethod
+    def default(cls):
+        p = cls()
+        defaults = [800, 1600, 2400, 3200, 5200, 6000]
+        for i, c in enumerate(defaults):
+            p.stages[i].x_cpi = c
+            p.stages[i].y_cpi = c
+        return p
+
+    @classmethod
+    def load(cls, path: Path):
+        p = cls.default()
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip() if "=" in raw else raw.strip()
+            # keep '#' for color values — strip comments only after key=
+            if "=" not in raw:
+                continue
+            k, _, v = raw.partition("=")
+            k = k.strip()
+            v = v.strip()
+            # strip trailing comment that appears after color (we rely on
+            # color spec coming before any '#' that's a comment)
+            if k.startswith("dpi.stage[") or k.startswith("button["):
+                pass
+            else:
+                if "#" in v:
+                    v = v.split("#", 1)[0].strip()
+
+            if k == "polling":
+                p.polling = int(v)
+            elif k == "sleep":
+                p.sleep_seconds = int(v)
+            elif k == "dpi.active":
+                p.dpi_active = int(v)
+            elif k == "dpi.count":
+                p.dpi_count = int(v)
+            elif k.startswith("dpi.stage["):
+                m = re.match(r"dpi\.stage\[(\d+)\]", k)
+                if not m: continue
+                idx = int(m.group(1))
+                if idx < 0 or idx >= NSTAGES: continue
+                m = re.search(r"(\d+)\s*/\s*(\d+)\s*#([0-9a-fA-F]{6})\s*flag\s*=\s*([0-9a-fA-F]+)", v)
+                if not m: continue
+                p.stages[idx].x_cpi = int(m.group(1))
+                p.stages[idx].y_cpi = int(m.group(2))
+                p.stages[idx].rgb   = "#" + m.group(3).upper()
+                p.stages[idx].flag  = int(m.group(4), 16)
+            elif k.startswith("button["):
+                m = re.match(r"button\[(\d+)", k)
+                if not m: continue
+                idx = int(m.group(1))
+                if idx < 0 or idx >= NBUTTONS: continue
+                parts = v.split()
+                if len(parts) < 3: continue
+                p.buttons[idx].type = parts[0]
+                p.buttons[idx].p1 = int(parts[1], 16)
+                p.buttons[idx].p2 = int(parts[2], 16)
+        return p
+
+    @classmethod
+    def from_device_text(cls, text: str):
+        """Parse the output of `sc360se read` into a Profile."""
+        p = cls.default()
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if k == "polling":
+                p.polling = int(v.split()[0])
+            elif k == "sleep":
+                p.sleep_seconds = int(v.rstrip("s").strip())
+            elif k == "dpi.active":
+                p.dpi_active = int(v)
+            elif k == "dpi.count":
+                p.dpi_count = int(v)
+            elif k.startswith("dpi["):
+                m = re.match(r"dpi\[(\d+)\]", k)
+                if not m: continue
+                idx = int(m.group(1))
+                if idx < 0 or idx >= NSTAGES: continue
+                m2 = re.search(r"(\d+)\s*/\s*(\d+)\s*#([0-9a-fA-F]{6})\s*flag\s*=\s*([0-9a-fA-F]+)", v)
+                if not m2: continue
+                p.stages[idx].x_cpi = int(m2.group(1))
+                p.stages[idx].y_cpi = int(m2.group(2))
+                p.stages[idx].rgb   = "#" + m2.group(3).upper()
+                p.stages[idx].flag  = int(m2.group(4), 16)
+            elif k.startswith("button["):
+                m = re.match(r"button\[(\d+)", k)
+                if not m: continue
+                idx = int(m.group(1))
+                if idx < 0 or idx >= NBUTTONS: continue
+                parts = v.split()
+                if len(parts) < 3: continue
+                p.buttons[idx].type = parts[0]
+                p.buttons[idx].p1 = int(parts[1], 16)
+                p.buttons[idx].p2 = int(parts[2], 16)
+        return p
+
+    def save(self, path: Path):
+        lines = ["# AULA SC360SE profile",
+                 f"polling = {self.polling}",
+                 f"sleep   = {self.sleep_seconds}",
+                 f"dpi.active = {self.dpi_active}",
+                 f"dpi.count  = {self.dpi_count}"]
+        for i, s in enumerate(self.stages):
+            r, g, b = bytes.fromhex(s.rgb.lstrip("#"))
+            lines.append(f"dpi.stage[{i}] = {s.x_cpi}/{s.y_cpi}  "
+                         f"#{r:02X}{g:02X}{b:02X}  flag={s.flag:02x}")
+        names = ["left","right","wheel","back-side","front-side","dpi-key"]
+        for i, b in enumerate(self.buttons):
+            lines.append(f"button[{i} {names[i]}] = {b.type} {b.p1:02x} {b.p2:02x}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def snap_dpi(value: int) -> int:
+    """Match the firmware quantization: 100 below 5000, 500 from 5000 up."""
+    if value <= 100: return 100
+    if value >= 26000: value = 26000
+    if value < 5000:
+        return (value // 100) * 100
+    return (value // 500) * 500
+
+def rgb_hex_to_tuple(rgb_hex: str):
+    h = rgb_hex.lstrip("#")
+    if len(h) != 6:
+        return 255, 255, 255
+    return tuple(bytes.fromhex(h))
+
+def rgb_tuple_to_hex(r: int, g: int, b: int) -> str:
+    return "#%02X%02X%02X" % (max(0, min(255, r)),
+                              max(0, min(255, g)),
+                              max(0, min(255, b)))
+
+# ─────────────────────────────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────────────────────────────
+
+CSS = b"""
+.section-title { font-weight: 700; font-size: 110%; }
+.dim          { opacity: 0.6; }
+.muted        { color: alpha(@theme_fg_color, 0.55); }
+.success      { color: #2ec27e; }
+.error        { color: #e01b24; }
+.stage-row    { padding: 6px; border-radius: 6px; }
+.stage-row.disabled { opacity: 0.4; }
+"""
+
+class Sc360seWindow(Gtk.ApplicationWindow):
+    def __init__(self, app, cli: Path, profiles_dir: Path):
+        super().__init__(application=app, title="AULA SC360SE")
+        self.set_default_size(740, 880)
+        self.cli = cli
+        self.profiles_dir = profiles_dir
+        self.profile = Profile.default()
+        self._guard = False  # stop signal feedback during programmatic UI sync
+        self._watch_proc = None
+        self._watch_tag = None
+        self.connect("close-request", self._on_close)
+
+        # CSS
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # Header
+        hdr = Gtk.HeaderBar()
+        self.set_titlebar(hdr)
+
+        self.refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        self.refresh_btn.set_tooltip_text("Read current config from device")
+        self.refresh_btn.connect("clicked", lambda *_: self.refresh_device())
+        hdr.pack_start(self.refresh_btn)
+
+        # Body
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_hexpand(True); scrolled.set_vexpand(True)
+        self.set_child(scrolled)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                       margin_start=20, margin_end=20,
+                       margin_top=18, margin_bottom=18)
+        scrolled.set_child(body)
+
+        body.append(self._build_status())
+        body.append(self._build_profile_bar())
+        body.append(Gtk.Separator())
+        body.append(self._build_dpi_section())
+        body.append(Gtk.Separator())
+        body.append(self._build_buttons_section())
+        body.append(Gtk.Separator())
+        body.append(self._build_misc_section())
+        body.append(Gtk.Separator())
+        body.append(self._build_danger_section())
+
+        # Toast/status
+        self.info = Gtk.Label(label="")
+        self.info.set_xalign(0)
+        self.info.add_css_class("muted")
+        body.append(self.info)
+
+        # Initial state
+        self.sync_ui_from_profile()
+        GLib.idle_add(self.refresh_device)
+
+    # ─── sections ─────────────────────────────────────────────────
+
+    def _build_status(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.dot = Gtk.Label(label="●")
+        self.dot.add_css_class("muted")
+        self.status_label = Gtk.Label(label="Detecting device…")
+        self.status_label.set_xalign(0)
+        self.status_label.set_hexpand(True)
+        box.append(self.dot)
+        box.append(self.status_label)
+        self.battery_label = Gtk.Label(label="")
+        self.battery_label.add_css_class("muted")
+        box.append(self.battery_label)
+        return box
+
+    def _build_profile_bar(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        title = Gtk.Label(label="Profile")
+        title.set_xalign(0); title.add_css_class("section-title")
+        box.append(title)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.profile_combo = Gtk.DropDown.new_from_strings([])
+        self.profile_combo.set_hexpand(True)
+        self.profile_combo.connect("notify::selected",
+                                   lambda *_: self._on_profile_selected())
+        row.append(self.profile_combo)
+
+        load_btn = Gtk.Button(label="Load")
+        load_btn.connect("clicked", lambda *_: self._on_profile_load())
+        row.append(load_btn)
+
+        save_btn = Gtk.Button(label="Save as…")
+        save_btn.connect("clicked", lambda *_: self._on_profile_save_as())
+        row.append(save_btn)
+
+        del_btn = Gtk.Button(label="Delete")
+        del_btn.connect("clicked", lambda *_: self._on_profile_delete())
+        row.append(del_btn)
+
+        box.append(row)
+        self._reload_profile_list()
+        return box
+
+    def _build_dpi_section(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        title = Gtk.Label(label="DPI stages")
+        title.set_xalign(0); title.add_css_class("section-title")
+        box.append(title)
+
+        topline = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        topline.append(Gtk.Label(label="Active:"))
+        self.dpi_active_combo = Gtk.DropDown.new_from_strings(
+            [f"Stage {i}" for i in range(NSTAGES)])
+        self.dpi_active_combo.connect("notify::selected",
+            lambda *_: (self._sync_field("dpi_active",
+                                         self.dpi_active_combo.get_selected()),
+                        self._write_dpi() if not self._guard else None))
+        topline.append(self.dpi_active_combo)
+
+        topline.append(Gtk.Label(label="Enabled count:"))
+        self.dpi_count_spin = Gtk.SpinButton.new_with_range(1, NSTAGES, 1)
+        self.dpi_count_spin.connect("value-changed",
+            lambda w: (self._sync_field("dpi_count", int(w.get_value())),
+                       self._update_stage_sensitivity(),
+                       self._write_dpi() if not self._guard else None))
+        topline.append(self.dpi_count_spin)
+        box.append(topline)
+
+        self.stage_rows = []
+        for i in range(NSTAGES):
+            row = self._build_stage_row(i)
+            self.stage_rows.append(row)
+            box.append(row["box"])
+        return box
+
+    def _build_stage_row(self, i):
+        b = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        b.add_css_class("stage-row")
+
+        label = Gtk.Label(label=f"Stage {i}")
+        label.set_xalign(0); label.set_size_request(80, -1)
+        b.append(label)
+
+        spin = Gtk.SpinButton.new_with_range(100, 26000, 100)
+        spin.set_size_request(120, -1)
+        b.append(spin)
+
+        slider = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
+                                          100, 26000, 100)
+        slider.set_hexpand(True)
+        slider.set_draw_value(False)
+        b.append(slider)
+
+        def on_spin(_w):
+            v = snap_dpi(int(spin.get_value()))
+            if not self._guard:
+                self.profile.stages[i].x_cpi = v
+                self.profile.stages[i].y_cpi = v
+                self._debounce(self._write_dpi)
+            self._guard = True
+            spin.set_value(v); slider.set_value(v)
+            self._guard = False
+
+        def on_slider(_w):
+            v = snap_dpi(int(slider.get_value()))
+            if not self._guard:
+                self.profile.stages[i].x_cpi = v
+                self.profile.stages[i].y_cpi = v
+                self._debounce(self._write_dpi)
+            self._guard = True
+            spin.set_value(v); slider.set_value(v)
+            self._guard = False
+
+        spin.connect("value-changed", on_spin)
+        slider.connect("value-changed", on_slider)
+
+        rgb_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        r_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
+        g_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
+        b_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
+        for text, w in (("R", r_spin), ("G", g_spin), ("B", b_spin)):
+            rgb_box.append(Gtk.Label(label=text))
+            w.set_size_request(66, -1)
+            rgb_box.append(w)
+
+        preview = Gtk.DrawingArea()
+        preview.set_content_width(36)
+        preview.set_content_height(24)
+        preview.set_tooltip_text("Exact RGB preview written to the mouse")
+        def draw_preview(_area, cr, width, height):
+            r, g, bb = rgb_hex_to_tuple(self.profile.stages[i].rgb)
+            cr.set_source_rgb(r / 255.0, g / 255.0, bb / 255.0)
+            cr.rectangle(0, 0, width, height)
+            cr.fill()
+            cr.set_source_rgba(0, 0, 0, 0.45)
+            cr.set_line_width(1)
+            cr.rectangle(0.5, 0.5, max(0, width - 1), max(0, height - 1))
+            cr.stroke()
+        preview.set_draw_func(draw_preview)
+        rgb_box.append(preview)
+
+        def on_rgb(*_):
+            if not self._guard:
+                self.profile.stages[i].rgb = rgb_tuple_to_hex(
+                    int(r_spin.get_value()),
+                    int(g_spin.get_value()),
+                    int(b_spin.get_value()))
+                self._debounce(self._write_colors)
+            preview.queue_draw()
+        r_spin.connect("value-changed", on_rgb)
+        g_spin.connect("value-changed", on_rgb)
+        b_spin.connect("value-changed", on_rgb)
+        b.append(rgb_box)
+
+        led_chk = Gtk.CheckButton(label="LED")
+        led_chk.set_tooltip_text(
+            "When this stage is active, light the LED with the chosen color "
+            "(flag=0xff). Uncheck to keep the LED dark on this stage.")
+        def on_led(_w):
+            if not self._guard:
+                self.profile.stages[i].flag = 0xff if led_chk.get_active() else 0x00
+                self._write_colors()
+        led_chk.connect("toggled", on_led)
+        b.append(led_chk)
+
+        return {"box": b, "spin": spin, "slider": slider,
+                "r": r_spin, "g": g_spin, "b": b_spin,
+                "preview": preview, "led": led_chk, "label": label}
+
+    def _build_buttons_section(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        title = Gtk.Label(label="Buttons")
+        title.set_xalign(0); title.add_css_class("section-title")
+        box.append(title)
+
+        self.button_rows = []
+        for i, name in enumerate(BUTTON_LABELS):
+            row = self._build_button_row(i, name)
+            if i == 5:
+                row["box"].set_sensitive(False)
+                row["box"].set_tooltip_text(
+                    "The physical DPI key is handled by firmware. Captures show "
+                    "that remapping it can disable local DPI switching until a "
+                    "factory reset, so the GUI keeps it locked.")
+            self.button_rows.append(row)
+            box.append(row["box"])
+        return box
+
+    def _build_button_row(self, i, name):
+        b = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+
+        label = Gtk.Label(label=name)
+        label.set_xalign(0); label.set_size_request(110, -1)
+        b.append(label)
+
+        type_combo = Gtk.DropDown.new_from_strings(
+            [t[1] for t in ACTION_TYPES])
+        b.append(type_combo)
+
+        # Stack of param widgets — one row per type, swapped via reveal
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        stack.set_hexpand(True)
+
+        # mouse: single dropdown
+        m_combo = Gtk.DropDown.new_from_strings([m[1] for m in MOUSE_BUTTONS])
+        m_combo.connect("notify::selected",
+            lambda *_: self._set_button(i, "mouse",
+                                        MOUSE_BUTTONS[m_combo.get_selected()][0], 0))
+        stack.add_named(m_combo, "mouse")
+
+        # dpi:
+        d_combo = Gtk.DropDown.new_from_strings([d[1] for d in DPI_ACTIONS])
+        d_combo.connect("notify::selected",
+            lambda *_: self._set_button(i, "dpi",
+                                        DPI_ACTIONS[d_combo.get_selected()][0], 0))
+        stack.add_named(d_combo, "dpi")
+
+        # disable:
+        dis = Gtk.Label(label="(no parameters)")
+        dis.add_css_class("muted")
+        stack.add_named(dis, "disable")
+
+        # key: usage + modifier checkboxes
+        krow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        k_combo = Gtk.DropDown.new_from_strings([k[1] for k in HID_KEYS])
+        krow.append(k_combo)
+        mod_chks = []
+        for v, mn in KBD_MODS[:4]:    # show only Left modifiers in the row
+            chk = Gtk.CheckButton(label=mn)
+            chk.connect("toggled",
+                lambda *_: self._update_key_button(i, k_combo, mod_chks))
+            krow.append(chk)
+            mod_chks.append((v, chk))
+        k_combo.connect("notify::selected",
+            lambda *_: self._update_key_button(i, k_combo, mod_chks))
+        stack.add_named(krow, "key")
+
+        # consumer:
+        c_combo = Gtk.DropDown.new_from_strings([c[1] for c in CONSUMER_KEYS])
+        def on_consumer(*_):
+            usage = CONSUMER_KEYS[c_combo.get_selected()][0]
+            self._set_button(i, "consumer", usage & 0xff, (usage >> 8) & 0xff)
+        c_combo.connect("notify::selected", on_consumer)
+        stack.add_named(c_combo, "consumer")
+
+        b.append(stack)
+
+        def on_type(*_):
+            t = ACTION_TYPES[type_combo.get_selected()][0]
+            stack.set_visible_child_name(t)
+            # apply current widget state for that type
+            if t == "mouse":
+                self._set_button(i, "mouse",
+                                 MOUSE_BUTTONS[m_combo.get_selected()][0], 0)
+            elif t == "dpi":
+                self._set_button(i, "dpi",
+                                 DPI_ACTIONS[d_combo.get_selected()][0], 0)
+            elif t == "disable":
+                self._set_button(i, "disable", 0, 0)
+            elif t == "key":
+                self._update_key_button(i, k_combo, mod_chks)
+            elif t == "consumer":
+                usage = CONSUMER_KEYS[c_combo.get_selected()][0]
+                self._set_button(i, "consumer", usage & 0xff, (usage >> 8) & 0xff)
+        type_combo.connect("notify::selected", on_type)
+
+        return {"box": b, "type": type_combo, "stack": stack,
+                "m": m_combo, "d": d_combo, "k": k_combo, "c": c_combo,
+                "mods": mod_chks}
+
+    def _build_misc_section(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        title = Gtk.Label(label="Other")
+        title.set_xalign(0); title.add_css_class("section-title")
+        box.append(title)
+
+        polling_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        polling_row.append(Gtk.Label(label="Polling rate:"))
+        self.polling_combo = Gtk.DropDown.new_from_strings(
+            [f"{r} Hz" for r in POLLING_RATES])
+        self.polling_combo.connect("notify::selected",
+            lambda *_: (self._sync_field("polling",
+                                         POLLING_RATES[self.polling_combo.get_selected()]),
+                        self._write_polling() if not self._guard else None))
+        polling_row.append(self.polling_combo)
+        box.append(polling_row)
+
+        sleep_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        sleep_row.append(Gtk.Label(label="Sleep timeout (s):"))
+        self.sleep_spin = Gtk.SpinButton.new_with_range(0, 65535, 30)
+        self.sleep_spin.connect("value-changed",
+            lambda w: (self._sync_field("sleep_seconds", int(w.get_value())),
+                       self._debounce(self._write_sleep) if not self._guard else None))
+        sleep_row.append(self.sleep_spin)
+        box.append(sleep_row)
+        return box
+
+    def _build_danger_section(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        title = Gtk.Label(label="Recovery")
+        title.set_xalign(0); title.add_css_class("section-title")
+        box.append(title)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        desc = Gtk.Label(label="Factory reset restores firmware defaults and repairs a stuck DPI key.")
+        desc.set_xalign(0)
+        desc.set_hexpand(True)
+        desc.add_css_class("muted")
+        row.append(desc)
+
+        self.reset_btn = Gtk.Button(label="Factory reset")
+        self.reset_btn.add_css_class("destructive-action")
+        self.reset_btn.set_tooltip_text("Restore firmware defaults; repairs a stuck/inert DPI key")
+        self.reset_btn.connect("clicked", lambda *_: self.do_factory_reset())
+        row.append(self.reset_btn)
+        box.append(row)
+        return box
+
+    # ─── state plumbing ────────────────────────────────────────────
+
+    def _sync_field(self, attr, value):
+        if not self._guard:
+            setattr(self.profile, attr, value)
+
+    def _set_button(self, idx, type_name, p1, p2):
+        if self._guard: return
+        self.profile.buttons[idx].type = type_name
+        self.profile.buttons[idx].p1 = p1
+        self.profile.buttons[idx].p2 = p2
+        self._write_buttons()
+
+    def _update_key_button(self, idx, k_combo, mod_chks):
+        usage = HID_KEYS[k_combo.get_selected()][0]
+        mod = 0
+        for v, chk in mod_chks:
+            if chk.get_active():
+                mod |= v
+        self._set_button(idx, "key", mod, usage)
+
+    def _update_stage_sensitivity(self):
+        for i, row in enumerate(self.stage_rows):
+            on = i < self.profile.dpi_count
+            row["box"].set_sensitive(on)
+            (row["box"].remove_css_class("disabled") if on
+             else row["box"].add_css_class("disabled"))
+
+    def sync_ui_from_profile(self):
+        self._guard = True
+        try:
+            # polling
+            try:
+                self.polling_combo.set_selected(POLLING_RATES.index(self.profile.polling))
+            except ValueError:
+                self.polling_combo.set_selected(POLLING_RATES.index(1000))
+            # sleep
+            self.sleep_spin.set_value(self.profile.sleep_seconds)
+            # dpi
+            self.dpi_active_combo.set_selected(min(self.profile.dpi_active, NSTAGES-1))
+            self.dpi_count_spin.set_value(self.profile.dpi_count)
+            for i, s in enumerate(self.profile.stages):
+                self.stage_rows[i]["spin"].set_value(s.x_cpi)
+                self.stage_rows[i]["slider"].set_value(s.x_cpi)
+                r, g, b = rgb_hex_to_tuple(s.rgb)
+                self.stage_rows[i]["r"].set_value(r)
+                self.stage_rows[i]["g"].set_value(g)
+                self.stage_rows[i]["b"].set_value(b)
+                self.stage_rows[i]["preview"].queue_draw()
+                self.stage_rows[i]["led"].set_active(s.flag == 0xff)
+            self._update_stage_sensitivity()
+            # buttons
+            for i, btn in enumerate(self.profile.buttons):
+                row = self.button_rows[i]
+                # type
+                idx = next((j for j,(k,_) in enumerate(ACTION_TYPES) if k == btn.type), 0)
+                row["type"].set_selected(idx)
+                row["stack"].set_visible_child_name(btn.type)
+                if btn.type == "mouse":
+                    j = next((k for k,(b,_) in enumerate(MOUSE_BUTTONS) if b == btn.p1), 0)
+                    row["m"].set_selected(j)
+                elif btn.type == "dpi":
+                    j = next((k for k,(b,_) in enumerate(DPI_ACTIONS) if b == btn.p1), 0)
+                    row["d"].set_selected(j)
+                elif btn.type == "key":
+                    j = next((k for k,(u,_) in enumerate(HID_KEYS) if u == btn.p2), 0)
+                    row["k"].set_selected(j)
+                    for v, chk in row["mods"]:
+                        chk.set_active(bool(btn.p1 & v))
+                elif btn.type == "consumer":
+                    usage = btn.p1 | (btn.p2 << 8)
+                    j = next((k for k,(u,_) in enumerate(CONSUMER_KEYS) if u == usage), 0)
+                    row["c"].set_selected(j)
+        finally:
+            self._guard = False
+
+    # ─── profiles ──────────────────────────────────────────────────
+
+    def _profile_paths(self):
+        return sorted(self.profiles_dir.glob("*.cfg"))
+
+    def _reload_profile_list(self):
+        self._guard = True
+        try:
+            files = self._profile_paths()
+            names = [f.stem for f in files] or ["(no profiles)"]
+            sm = Gtk.StringList.new(names)
+            self.profile_combo.set_model(sm)
+            self.profile_combo.set_sensitive(bool(files))
+        finally:
+            self._guard = False
+
+    def _on_profile_selected(self):
+        if self._guard: return
+        # selection only — load on demand
+
+    def _on_profile_load(self):
+        files = self._profile_paths()
+        if not files:
+            self.notify("No saved profiles", err=True); return
+        idx = self.profile_combo.get_selected()
+        if idx < 0 or idx >= len(files): return
+        try:
+            self.profile = Profile.load(files[idx])
+        except Exception as e:
+            self.notify(f"Load failed: {e}", err=True); return
+        self.sync_ui_from_profile()
+        self.notify(f"Loaded {files[idx].name}")
+
+    def _on_profile_save_as(self):
+        dlg = Gtk.Window(transient_for=self, title="Save profile as", modal=True)
+        dlg.set_default_size(360, 100)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_start=14, margin_end=14, margin_top=14, margin_bottom=14)
+        dlg.set_child(box)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("profile name (e.g. fps)")
+        box.append(entry)
+        btnrow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                         spacing=8, halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: dlg.destroy())
+        ok = Gtk.Button(label="Save"); ok.add_css_class("suggested-action")
+        def do_save(*_):
+            name = entry.get_text().strip()
+            if not name:
+                return
+            path = self.profiles_dir / f"{name}.cfg"
+            try:
+                self.profile.save(path)
+            except Exception as e:
+                self.notify(f"Save failed: {e}", err=True)
+            else:
+                self._reload_profile_list()
+                self.notify(f"Saved {path.name}")
+            dlg.destroy()
+        ok.connect("clicked", do_save)
+        entry.connect("activate", do_save)
+        btnrow.append(cancel); btnrow.append(ok)
+        box.append(btnrow)
+        dlg.present()
+
+    def _on_profile_delete(self):
+        files = self._profile_paths()
+        if not files: return
+        idx = self.profile_combo.get_selected()
+        if idx < 0 or idx >= len(files): return
+        path = files[idx]
+        try:
+            path.unlink()
+        except Exception as e:
+            self.notify(f"Delete failed: {e}", err=True); return
+        self._reload_profile_list()
+        self.notify(f"Deleted {path.name}")
+
+    # ─── device ────────────────────────────────────────────────────
+
+    def refresh_device(self):
+        try:
+            out = run_cli(self.cli, "read")
+            self.profile = Profile.from_device_text(out)
+            self.sync_ui_from_profile()
+
+            self.dot.remove_css_class("muted")
+            self.dot.remove_css_class("error")
+            self.dot.add_css_class("success")
+
+            # Extract device-info header lines for the status bar
+            info_parts = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("hidraw") or line.startswith("vid:pid") or \
+                   line.startswith("link") or line.startswith("device"):
+                    info_parts.append(line)
+            self.status_label.set_text("  ·  ".join(info_parts))
+
+            self._start_watch()
+        except (CliError, FileNotFoundError) as e:
+            self.dot.remove_css_class("success")
+            self.dot.add_css_class("error")
+            self.status_label.set_text(f"Not connected: {e}")
+            self.battery_label.set_text("")
+        return False
+
+    def _start_watch(self):
+        """Spawn `sc360se watch` as a background subprocess to receive
+        unsolicited DPI-change and battery notifications from the mouse."""
+        if hasattr(self, '_watch_proc') and self._watch_proc is not None:
+            return
+        try:
+            self._watch_proc = subprocess.Popen(
+                [str(self.cli), "watch"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1)
+            self._watch_tag = GLib.io_add_watch(
+                self._watch_proc.stdout,
+                GLib.IO_IN | GLib.IO_HUP,
+                self._on_watch_output)
+        except Exception:
+            pass
+
+    def _on_watch_output(self, source, condition):
+        if condition & GLib.IO_HUP:
+            self._stop_watch()
+            return False
+        line = source.readline()
+        if not line:
+            self._stop_watch()
+            return False
+        line = line.strip()
+        # dpi: stage 2/6 → 2400 cpi
+        if line.startswith("dpi: stage "):
+            import re
+            m = re.match(r"dpi: stage (\d+)/(\d+) → (\d+) cpi", line)
+            if m:
+                active = int(m.group(1))
+                if active != self.profile.dpi_active:
+                    self.profile.dpi_active = active
+                    self._guard = True
+                    try:
+                        self.dpi_active_combo.set_selected(active)
+                    finally:
+                        self._guard = False
+        # battery: 92%
+        elif line.startswith("battery: "):
+            pct = line.split(": ", 1)[1].rstrip("%")
+            self.battery_label.set_text(f"Battery: {pct}")
+        return True
+
+    def _stop_watch(self):
+        if hasattr(self, '_watch_tag') and self._watch_tag:
+            GLib.source_remove(self._watch_tag)
+            self._watch_tag = None
+        if hasattr(self, '_watch_proc') and self._watch_proc:
+            try:
+                self._watch_proc.terminate()
+                self._watch_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._watch_proc.kill()
+                except Exception:
+                    pass
+            self._watch_proc = None
+
+    def _on_close(self, *_):
+        self._stop_watch()
+        return False  # let default handler destroy the window
+
+    # ─── immediate writes ──────────────────────────────────────────
+
+    def _debounce(self, callback, ms=250):
+        """Debounce rapid-fire changes (sliders etc.) before writing."""
+        if hasattr(self, '_debounce_src') and self._debounce_src:
+            GLib.source_remove(self._debounce_src)
+        self._debounce_src = GLib.timeout_add(ms, self._run_debounced, callback)
+
+    def _run_debounced(self, callback):
+        self._debounce_src = None
+        try:
+            callback()
+        except CliError:
+            pass
+
+    def _write_dpi(self):
+        p = self.profile
+        parts = [str(p.dpi_active), str(p.dpi_count)]
+        for s in p.stages:
+            parts.append(f"{s.x_cpi}/{s.y_cpi}")
+        run_cli(self.cli, "dpi", *parts, timeout=5)
+        run_cli(self.cli, "commit")
+
+    def _write_colors(self):
+        p = self.profile
+        parts = []
+        for s in p.stages:
+            r, g, b = rgb_hex_to_tuple(s.rgb)
+            parts.append(f"{r:02x}/{g:02x}/{b:02x}/{s.flag:02x}")
+        run_cli(self.cli, "write-colors", *parts, timeout=5)
+        run_cli(self.cli, "commit")
+
+    def _write_buttons(self):
+        parts = []
+        for b in self.profile.buttons:
+            parts.append(f"{b.type:02x}/{b.p1:02x}/{b.p2:02x}")
+        run_cli(self.cli, "write-buttons", *parts, timeout=5)
+        run_cli(self.cli, "commit")
+
+    def _write_polling(self):
+        run_cli(self.cli, "polling", str(self.profile.polling))
+        run_cli(self.cli, "commit")
+
+    def _write_sleep(self):
+        run_cli(self.cli, "sleep", str(self.profile.sleep_seconds))
+        run_cli(self.cli, "commit")
+
+    def do_factory_reset(self):
+        dlg = Gtk.AlertDialog()
+        dlg.set_message("Factory reset the mouse?")
+        dlg.set_detail(
+            "This sends the firmware factory-reset command captured from the "
+            "Windows driver. It restores the hidden DPI-key state and may reset "
+            "DPI stages, colors, polling rate, button mappings and sleep timeout."
+        )
+        dlg.set_buttons(["Cancel", "Factory reset"])
+        dlg.set_cancel_button(0)
+        dlg.set_default_button(1)
+
+        def on_done(_dialog, result):
+            try:
+                choice = dlg.choose_finish(result)
+            except Exception as e:
+                self.notify(f"Factory reset cancelled: {e}", err=True)
+                return
+            if choice != 1:
+                self.notify("Factory reset cancelled")
+                return
+            try:
+                run_cli(self.cli, "factory-reset")
+                self.notify("Factory reset sent; wait a few seconds, then press the DPI key")
+            except CliError as e:
+                self.notify(f"Factory reset failed: {e}", err=True)
+
+        dlg.choose(self, None, on_done)
+
+    def notify(self, msg, err=False):
+        self.info.remove_css_class("error")
+        if err: self.info.add_css_class("error")
+        self.info.set_text(msg)
+        # auto-clear after 4 s
+        GLib.timeout_add_seconds(4, lambda: (self.info.set_text(""), False)[1])
+
+# ─────────────────────────────────────────────────────────────────────
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.sc360se.gui",
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        try:
+            cli = find_cli()
+        except FileNotFoundError as e:
+            d = Gtk.AlertDialog()
+            d.set_message("sc360se binary not found")
+            d.set_detail("Build the C driver first: `make` in this directory,\n"
+                         "or install it system-wide.")
+            d.show()
+            return
+
+        profiles_dir = Path.home() / ".config" / "sc360se"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        # If running from source tree and no user profiles yet, seed them.
+        seed = HERE / "profiles"
+        if seed.exists() and not list(profiles_dir.glob("*.cfg")):
+            for f in seed.glob("*.cfg"):
+                shutil.copy(f, profiles_dir / f.name)
+
+        win = Sc360seWindow(self, cli, profiles_dir)
+        win.present()
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

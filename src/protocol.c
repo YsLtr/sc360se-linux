@@ -1,0 +1,378 @@
+/*
+ * Wire format reverse-engineered from:
+ *   wireshark_catch1.pdml  — initial broad capture
+ *   侧键改为左键.txt          — side button → LMB
+ *   侧键2改为左键.txt         — rear side button → LMB
+ *   侧键改为A键.txt           — side button → keyboard 'A'
+ *   侧键改为Ctrl+C.txt        — side button → Ctrl+C
+ *   侧键改为DPI循环和DPI+以及DPI-.txt — DPI cycle / +/-
+ *   侧键改为禁用.txt          — disable button
+ *   滚轮键改为右键.txt        — wheel button → RMB
+ *   将DPI档位1设置为1234.txt  — DPI stage 1 = 1234 (snapped to 1200)
+ *   把DPI档位2改为5678.txt    — DPI stage 2 = 5678 (snapped to 5000)
+ *   将配置1切换到配置2、3、4.pcapng — profile-switch readback
+ *   连接+切换DPI.pcapng — handshake replies, battery (0xc0), DPI
+ *                         button notification (0xc2), readback format
+ *
+ * Frame: 32 bytes, sent as HID Output Report on EP 0x05, mirrored as
+ * HID Input Report on EP 0x84.
+ *
+ *   [0]      command class
+ *   [1]      0x00 = request, 0x01 = ack, 0x02 = error
+ *   [2]      0x00 = meta/discovery, 0x01 = config, 0xff = error context
+ *   [3]      sub-command
+ *   [4..30]  payload
+ *   [31]     checksum = sum(bytes[4..30]) mod 256
+ */
+
+#include "sc360se.h"
+
+#include <errno.h>
+#include <string.h>
+
+static void frame_init(uint8_t *f, uint8_t op, uint8_t ns, uint8_t sub)
+{
+    memset(f, 0, SC360SE_FRAME_LEN);
+    f[0] = op;
+    f[1] = 0x00;
+    f[2] = ns;
+    f[3] = sub;
+}
+
+/* ------------------------------------------------------------------ */
+/* Discovery handshake                                                */
+/* ------------------------------------------------------------------ */
+
+int sc360se_handshake(struct sc360se_device *dev)
+{
+    static const uint8_t seq[] = {0x10, 0x10, 0x11, 0x12, 0x13,
+                                  0x14, 0x15, 0x16, 0x17, 0x20};
+    uint8_t out[SC360SE_FRAME_LEN], in[SC360SE_FRAME_LEN];
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(seq); i++) {
+        memset(out, 0, SC360SE_FRAME_LEN);
+        out[0] = seq[i];
+        rc = sc360se_xfer(dev, out, in);
+        if (rc == -ETIMEDOUT) { rc = 0; continue; }
+        if (rc < 0) return rc;
+        if (seq[i] == 0x10 && in[3] == 0x0b) {
+            memcpy(dev->dev_id, &in[4], 4);
+            dev->dev_id[4] = 0;
+        }
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Polling rate     (op 0x02, sub 0x01)                               */
+/* ------------------------------------------------------------------ */
+
+int sc360se_set_polling_rate(struct sc360se_device *dev,
+                             enum sc360se_polling_rate hz)
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x02, 0x01, 0x01);
+    f[4] = (uint8_t)hz;
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* DPI configuration  (op 0x03, sub 0x25)                             */
+/* ------------------------------------------------------------------ */
+
+int sc360se_set_dpi(struct sc360se_device *dev,
+                    const struct sc360se_dpi_config *cfg)
+{
+    if (cfg->active >= SC360SE_NSTAGES) return -EINVAL;
+    if (cfg->count == 0 || cfg->count > SC360SE_NSTAGES) return -EINVAL;
+
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x03, 0x01, 0x25);
+    f[4] = (uint8_t)((cfg->active << 4) | (cfg->count & 0x0f));
+
+    /* Hardware DPI granularity (per user observation):
+     *   below 5000 cpi: snap to nearest 100
+     *   5000 cpi and above: snap to nearest 500
+     * The wire format always stores cpi/100 (LE u16). */
+    for (int i = 0; i < SC360SE_NSTAGES; i++) {
+        uint16_t x = cfg->stage[i].x_cpi / 100;
+        uint16_t y = cfg->stage[i].y_cpi / 100;
+        f[5 + i*4 + 0] = (uint8_t)(x & 0xff);
+        f[5 + i*4 + 1] = (uint8_t)(x >> 8);
+        f[5 + i*4 + 2] = (uint8_t)(y & 0xff);
+        f[5 + i*4 + 3] = (uint8_t)(y >> 8);
+    }
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* DPI per-stage colors  (op 0x04, sub 0x12)                          */
+/*                                                                    */
+/* 6 stages × 3 bytes RGB at [4..21], then 6 flag bytes at [22..27].  */
+/*                                                                    */
+/* Verified against 连接+切换DPI.pcapng frame #19233: the 0x14 readback*/
+/* shows the RGB block first (Red,Green,Blue,Magenta,Yellow,Cyan for  */
+/* factory defaults), followed by 6 independent flag bytes.           */
+/*                                                                    */
+/* The flag byte is the "LED enabled" bit for the stage:              */
+/*   0xff = LED shows this color when this stage is active            */
+/*   0x00 = LED stays OFF when this stage is active                   */
+/* ------------------------------------------------------------------ */
+
+int sc360se_set_dpi_colors(struct sc360se_device *dev,
+                           const struct sc360se_dpi_config *cfg)
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x04, 0x01, 0x12);
+    for (int i = 0; i < SC360SE_NSTAGES; i++) {
+        f[4 + i*3 + 0] = cfg->stage[i].r;
+        f[4 + i*3 + 1] = cfg->stage[i].g;
+        f[4 + i*3 + 2] = cfg->stage[i].b;
+        f[22 + i]        = cfg->stage[i].flag;
+    }
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sleep timeout  (op 0x07, sub 0x04)                                 */
+/* ------------------------------------------------------------------ */
+
+int sc360se_set_sleep_seconds(struct sc360se_device *dev, uint16_t seconds)
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x07, 0x01, 0x04);
+    f[4] = (uint8_t)(seconds & 0xff);
+    f[5] = (uint8_t)(seconds >> 8);
+    f[7] = 0x08;
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Button mapping  (op 0x09, sub 0x0f)                                */
+/*                                                                    */
+/* Six 3-byte slots at [4..21]:                                       */
+/*    [4..6]   left mouse button                                      */
+/*    [7..9]   right mouse button                                     */
+/*    [10..12] wheel button                                           */
+/*    [13..15] rear side button                                       */
+/*    [16..18] front side button                                      */
+/*    [19..21] DPI button                                             */
+/* Each slot: type, param1, param2 (see sc360se_action_type).         */
+/* ------------------------------------------------------------------ */
+
+int sc360se_set_buttons(struct sc360se_device *dev,
+                        const struct sc360se_button_action acts[SC360SE_NBUTTONS])
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x09, 0x01, 0x0f);
+    for (int i = 0; i < SC360SE_NBUTTONS; i++) {
+        f[4 + i*3 + 0] = (uint8_t)acts[i].type;
+        f[4 + i*3 + 1] = acts[i].p1;
+        f[4 + i*3 + 2] = acts[i].p2;
+    }
+    /* The physical DPI key has a hidden firmware mode bit outside this
+     * visible 0x09 table. Writing anything except factory local-cycle can
+     * leave the key inert until factory reset; keep high-level writes safe. */
+    f[4 + SC360SE_BTN_DPI*3 + 0] = SC360SE_ACT_DPI;
+    f[4 + SC360SE_BTN_DPI*3 + 1] = SC360SE_DPI_CYCLE;
+    f[4 + SC360SE_BTN_DPI*3 + 2] = 0x00;
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Commit / save profile  (op 0x06, sub 0x05)                         */
+/*                                                                    */
+/* Sent by the Windows driver after every write to flush settings.    */
+/* Payload byte [4] varies (0x01, 0x02 observed) — exact semantics    */
+/* not pinned down; sending 0x01 0x00 0x01 0x00 (the value seen       */
+/* during the profile-switch readback sequence) appears safe.         */
+/* ------------------------------------------------------------------ */
+
+int sc360se_commit(struct sc360se_device *dev)
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x06, 0x01, 0x05);
+    f[4] = 0x01;
+    f[6] = 0x01;
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Factory reset  (op 0x0f, sub 0x01)                                 */
+/*                                                                    */
+/* Captured from the Windows app while using "恢复出厂设置":           */
+/*   0f 00 01 01 ff 00 ... 00 ff                                      */
+/*                                                                    */
+/* This is not equivalent to rewriting the visible profile. It also   */
+/* clears hidden firmware state used by the dedicated DPI key path.    */
+/* If the DPI key was remapped and becomes inert, this command brings  */
+/* back local hardware DPI switching.                                  */
+/* ------------------------------------------------------------------ */
+
+int sc360se_factory_reset(struct sc360se_device *dev)
+{
+    uint8_t f[SC360SE_FRAME_LEN];
+    frame_init(f, 0x0f, 0x01, 0x01);
+    f[4] = 0xff;
+    return sc360se_send(dev, f);
+}
+
+/* ------------------------------------------------------------------ */
+/* Internal query — send bare opcode, get reply                       */
+/* ------------------------------------------------------------------ */
+
+static int query(struct sc360se_device *dev, uint8_t op, uint8_t *reply)
+{
+    uint8_t out[SC360SE_FRAME_LEN];
+    memset(out, 0, SC360SE_FRAME_LEN);
+    out[0] = op;
+    return sc360se_xfer(dev, out, reply);
+}
+
+/* ------------------------------------------------------------------ */
+/* Read full current config from device                               */
+/*                                                                    */
+/* Sends the same 10-query handshake the Windows driver uses on       */
+/* connect and parses every reply into a profile. Verified against    */
+/* 连接+切换DPI.pcapng.                                                */
+/* ------------------------------------------------------------------ */
+
+int sc360se_read_config(struct sc360se_device *dev,
+                         struct sc360se_profile *out)
+{
+    uint8_t in[SC360SE_FRAME_LEN];
+    int rc;
+
+    sc360se_profile_default(out);
+
+    static const uint8_t seq[] = {0x10, 0x10, 0x11, 0x12, 0x13,
+                                  0x14, 0x15, 0x16, 0x17, 0x20};
+
+    for (size_t i = 0; i < sizeof(seq); i++) {
+        rc = query(dev, seq[i], in);
+        if (rc == -ETIMEDOUT) { rc = 0; continue; }
+        if (rc < 0) return rc;
+
+        switch (seq[i]) {
+        case 0x10:
+            if (in[3] == 0x0b && !dev->dev_id[0]) {
+                memcpy(dev->dev_id, &in[4], 4);
+                dev->dev_id[4] = 0;
+            }
+            break;
+        case 0x11:
+            if (in[3] == 0x12) {
+                for (int j = 0; j < SC360SE_NBUTTONS; j++) {
+                    out->buttons[j].type =
+                        (enum sc360se_action_type)in[4 + j*3];
+                    out->buttons[j].p1 = in[4 + j*3 + 1];
+                    out->buttons[j].p2 = in[4 + j*3 + 2];
+                }
+            }
+            break;
+        case 0x12:
+            if (in[3] == 0x01)
+                out->polling = (enum sc360se_polling_rate)in[4];
+            break;
+        case 0x13:
+            if (in[3] == 0x19) {
+                out->dpi.active = (in[4] >> 4) & 0x0f;
+                out->dpi.count  = in[4] & 0x0f;
+                for (int j = 0; j < SC360SE_NSTAGES; j++) {
+                    uint16_t x = (uint16_t)(in[5 + j*4] |
+                                   (in[5 + j*4 + 1] << 8));
+                    uint16_t y = (uint16_t)(in[5 + j*4 + 2] |
+                                   (in[5 + j*4 + 3] << 8));
+                    out->dpi.stage[j].x_cpi = x * 100;
+                    out->dpi.stage[j].y_cpi = y * 100;
+                }
+            }
+            break;
+        case 0x14:
+            if (in[3] == 0x12) {
+                for (int j = 0; j < SC360SE_NSTAGES; j++) {
+                    out->dpi.stage[j].r    = in[4 + j*3];
+                    out->dpi.stage[j].g    = in[4 + j*3 + 1];
+                    out->dpi.stage[j].b    = in[4 + j*3 + 2];
+                    out->dpi.stage[j].flag = in[22 + j];
+                }
+            }
+            break;
+        case 0x17:
+            if (in[3] == 0x05)
+                out->sleep_seconds = (uint16_t)(in[4] | (in[5] << 8));
+            break;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read battery percentage (0-100). Sends 0x10 query, extracts        */
+/* byte[13] from the reply. Returns <0 on error.                      */
+/* ------------------------------------------------------------------ */
+
+int sc360se_read_battery(struct sc360se_device *dev)
+{
+    uint8_t in[SC360SE_FRAME_LEN];
+    int rc = query(dev, 0x10, in);
+    if (rc < 0) return rc;
+    if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
+    return (int)in[13];
+}
+
+/* ------------------------------------------------------------------ */
+/* Decode an unsolicited notification frame                           */
+/*                                                                    */
+/*   0xc0 — battery: byte[2] = percentage 0-100                       */
+/*   0xc2 — DPI change: byte[1] = (active<<4)|count,                  */
+/*           byte[2..3] = cpi/100 LE u16                              */
+/* ------------------------------------------------------------------ */
+
+int sc360se_decode_event(const uint8_t *frame, struct sc360se_event *evt)
+{
+    memset(evt, 0, sizeof(*evt));
+    switch (frame[0]) {
+    case SC360SE_EVT_BATTERY:
+        evt->type = SC360SE_EVT_BATTERY;
+        evt->battery_pct = frame[2];
+        return 0;
+    case SC360SE_EVT_DPI:
+        evt->type = SC360SE_EVT_DPI;
+        evt->dpi_active = (frame[1] >> 4) & 0x0f;
+        evt->dpi_count  = frame[1] & 0x0f;
+        evt->dpi_cpi    = (uint16_t)(frame[2] | (frame[3] << 8)) * 100;
+        return 0;
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Quick status — battery + active DPI stage (2 queries)             */
+/*                                                                   */
+/* Returns 0 on success and fills *battery_pct (0-100) and           */
+/* *dpi_active. Either pointer may be NULL to skip that value.       */
+/* ------------------------------------------------------------------ */
+
+int sc360se_read_status(struct sc360se_device *dev,
+                         int *battery_pct, uint8_t *dpi_active)
+{
+    uint8_t in[SC360SE_FRAME_LEN];
+    int rc;
+
+    if (battery_pct) {
+        rc = query(dev, 0x10, in);
+        if (rc < 0) return rc;
+        if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
+        *battery_pct = (int)in[13];
+    }
+
+    if (dpi_active) {
+        rc = query(dev, 0x13, in);
+        if (rc < 0) return rc;
+        if (in[0] != 0x13 || in[3] != 0x19) return -EIO;
+        *dpi_active = (in[4] >> 4) & 0x0f;
+    }
+
+    return 0;
+}
