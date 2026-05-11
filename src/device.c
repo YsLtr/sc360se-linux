@@ -173,11 +173,14 @@ int sc360se_xfer(struct sc360se_device *dev, uint8_t *out, uint8_t *in)
     if (r < 0) return r;
     if (!in) return 0;
     /* Reply is on EP 0x84 within ~1ms; ignore unrelated async events. */
+    int saw_unrelated = 0;
     for (int tries = 0; tries < 8; tries++) {
         r = sc360se_recv(dev, in, 50);
+        if (r == -ETIMEDOUT) continue;
         if (r < 0) return r;
         if (in[0] == out[0]) return 0;          /* matching reply */
+        saw_unrelated = 1;
         if (debug_enabled()) dump_frame("IGNORE", in);
     }
-    return -EIO;
+    return saw_unrelated ? -EIO : -ETIMEDOUT;
 }

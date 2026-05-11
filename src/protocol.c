@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int debug_enabled(void)
 {
@@ -251,6 +252,148 @@ static int query_with_retries(struct sc360se_device *dev, uint8_t op, uint8_t *r
     return 0;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void drain_pending(struct sc360se_device *dev)
+{
+    uint8_t stale[SC360SE_FRAME_LEN];
+    for (int i = 0; i < 16; i++) {
+        int rc = sc360se_try_recv(dev, stale);
+        if (rc == -ETIMEDOUT) break;
+        if (rc < 0) break;
+        if (debug_enabled())
+            fprintf(stderr, "[sc360se] drained stale frame op=0x%02x\n", stale[0]);
+    }
+}
+
+static int send_bare_query(struct sc360se_device *dev, uint8_t op)
+{
+    uint8_t out[SC360SE_FRAME_LEN];
+    memset(out, 0, sizeof(out));
+    out[0] = op;
+    return sc360se_send(dev, out);
+}
+
+enum {
+    GOT_BUTTONS = 1u << 0,
+    GOT_POLLING = 1u << 1,
+    GOT_DPI     = 1u << 2,
+    GOT_COLORS  = 1u << 3,
+    GOT_SLEEP   = 1u << 4,
+};
+
+static const unsigned READ_NEED = GOT_BUTTONS | GOT_POLLING | GOT_DPI |
+                                  GOT_COLORS  | GOT_SLEEP;
+
+static void parse_config_reply(struct sc360se_device *dev,
+                               struct sc360se_profile *out,
+                               const uint8_t *in,
+                               unsigned *got)
+{
+    if (in[1] == 0x02) {
+        if (debug_enabled())
+            fprintf(stderr, "[sc360se] query 0x%02x failed with device error reply\n",
+                    in[0]);
+        return;
+    }
+
+    switch (in[0]) {
+    case 0x10:
+        if (in[3] == 0x0b && !dev->dev_id[0]) {
+            memcpy(dev->dev_id, &in[4], 4);
+            dev->dev_id[4] = 0;
+        }
+        break;
+    case 0x11:
+        if (in[3] == 0x12) {
+            for (int j = 0; j < SC360SE_NBUTTONS; j++) {
+                out->buttons[j].type =
+                    (enum sc360se_action_type)in[4 + j*3];
+                out->buttons[j].p1 = in[4 + j*3 + 1];
+                out->buttons[j].p2 = in[4 + j*3 + 2];
+            }
+            *got |= GOT_BUTTONS;
+        }
+        break;
+    case 0x12:
+        if (in[3] == 0x01) {
+            out->polling = (enum sc360se_polling_rate)in[4];
+            *got |= GOT_POLLING;
+        }
+        break;
+    case 0x13:
+        if (in[3] == 0x19) {
+            out->dpi.active = (in[4] >> 4) & 0x0f;
+            out->dpi.count  = in[4] & 0x0f;
+            for (int j = 0; j < SC360SE_NSTAGES; j++) {
+                uint16_t x = (uint16_t)(in[5 + j*4] |
+                               (in[5 + j*4 + 1] << 8));
+                uint16_t y = (uint16_t)(in[5 + j*4 + 2] |
+                               (in[5 + j*4 + 3] << 8));
+                out->dpi.stage[j].x_cpi = x * 100;
+                out->dpi.stage[j].y_cpi = y * 100;
+            }
+            *got |= GOT_DPI;
+        }
+        break;
+    case 0x14:
+        if (in[3] == 0x12) {
+            for (int j = 0; j < SC360SE_NSTAGES; j++) {
+                out->dpi.stage[j].r    = in[4 + j*3];
+                out->dpi.stage[j].g    = in[4 + j*3 + 1];
+                out->dpi.stage[j].b    = in[4 + j*3 + 2];
+                out->dpi.stage[j].flag = in[22 + j];
+            }
+            *got |= GOT_COLORS;
+        }
+        break;
+    case 0x17:
+        if (in[3] == 0x05) {
+            out->sleep_seconds = (uint16_t)(in[4] | (in[5] << 8));
+            *got |= GOT_SLEEP;
+        }
+        break;
+    }
+}
+
+static int collect_replies(struct sc360se_device *dev,
+                           struct sc360se_profile *out,
+                           unsigned *got,
+                           int timeout_ms)
+{
+    uint8_t in[SC360SE_FRAME_LEN];
+    int64_t deadline = monotonic_ms() + timeout_ms;
+    while ((*got & READ_NEED) != READ_NEED) {
+        int left = (int)(deadline - monotonic_ms());
+        if (left <= 0) break;
+        if (left > 80) left = 80;
+        int rc = sc360se_recv(dev, in, left);
+        if (rc == -ETIMEDOUT) continue;
+        if (rc < 0) return rc;
+        parse_config_reply(dev, out, in, got);
+    }
+    return 0;
+}
+
+static int resend_missing_query(struct sc360se_device *dev,
+                                struct sc360se_profile *out,
+                                unsigned *got,
+                                unsigned flag,
+                                uint8_t op)
+{
+    if (*got & flag) return 0;
+    if (debug_enabled())
+        fprintf(stderr, "[sc360se] retry missing config query 0x%02x\n", op);
+    int rc = send_bare_query(dev, op);
+    if (rc < 0) return rc;
+    return collect_replies(dev, out, got, 220);
+}
+
 /* ------------------------------------------------------------------ */
 /* Read full current config from device                               */
 /*                                                                    */
@@ -266,99 +409,60 @@ int sc360se_read_config(struct sc360se_device *dev,
     int rc;
     unsigned got = 0;
 
-    enum {
-        GOT_BUTTONS = 1u << 0,
-        GOT_POLLING = 1u << 1,
-        GOT_DPI     = 1u << 2,
-        GOT_COLORS  = 1u << 3,
-        GOT_SLEEP   = 1u << 4,
-    };
-
     sc360se_profile_default(out);
 
-    static const uint8_t seq[] = {0x10, 0x10, 0x11, 0x12, 0x13,
-                                  0x14, 0x15, 0x16, 0x17, 0x20};
+    drain_pending(dev);
 
+    /* The 2.4G dongle can answer 0x10 from its local state even when the
+     * mouse is asleep. In that state config queries return no useful data;
+     * fail early instead of showing the default profile as if it were real. */
+    rc = query_with_retries(dev, 0x10, in);
+    if (rc < 0) return rc;
+    if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
+    memcpy(dev->dev_id, &in[4], 4);
+    dev->dev_id[4] = 0;
+    if (in[14] == 0x00) {
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] dongle reports mouse not ready/asleep "
+                    "(0x10 reply byte[14]=00); wake/move/click the mouse\n");
+        return -EHOSTDOWN;
+    }
+
+    static const uint8_t seq[] = {0x10, 0x11, 0x12, 0x13,
+                                  0x14, 0x15, 0x16, 0x17, 0x20};
     for (size_t i = 0; i < sizeof(seq); i++) {
-        rc = query_with_retries(dev, seq[i], in);
-        if (rc == -ETIMEDOUT) { rc = 0; continue; }
+        rc = send_bare_query(dev, seq[i]);
         if (rc < 0) return rc;
 
-        if (seq[i] == 0x10 && in[3] == 0x0b && in[14] == 0x00) {
-            if (debug_enabled())
-                fprintf(stderr,
-                        "[sc360se] dongle reports mouse not ready/asleep "
-                        "(0x10 reply byte[14]=00); wake/move/click the mouse\n");
-            return -EHOSTDOWN;
-        }
+        int64_t step_deadline = monotonic_ms() + 180;
+        for (;;) {
+            int left = (int)(step_deadline - monotonic_ms());
+            if (left <= 0) break;
+            if (left > 60) left = 60;
 
-        if (in[1] == 0x02) {
-            if (debug_enabled())
-                fprintf(stderr, "[sc360se] query 0x%02x failed with device error reply\n",
-                        seq[i]);
-            continue;
-        }
-
-        switch (seq[i]) {
-        case 0x10:
-            if (in[3] == 0x0b && !dev->dev_id[0]) {
-                memcpy(dev->dev_id, &in[4], 4);
-                dev->dev_id[4] = 0;
-            }
-            break;
-        case 0x11:
-            if (in[3] == 0x12) {
-                for (int j = 0; j < SC360SE_NBUTTONS; j++) {
-                    out->buttons[j].type =
-                        (enum sc360se_action_type)in[4 + j*3];
-                    out->buttons[j].p1 = in[4 + j*3 + 1];
-                    out->buttons[j].p2 = in[4 + j*3 + 2];
-                }
-                got |= GOT_BUTTONS;
-            }
-            break;
-        case 0x12:
-            if (in[3] == 0x01) {
-                out->polling = (enum sc360se_polling_rate)in[4];
-                got |= GOT_POLLING;
-            }
-            break;
-        case 0x13:
-            if (in[3] == 0x19) {
-                out->dpi.active = (in[4] >> 4) & 0x0f;
-                out->dpi.count  = in[4] & 0x0f;
-                for (int j = 0; j < SC360SE_NSTAGES; j++) {
-                    uint16_t x = (uint16_t)(in[5 + j*4] |
-                                   (in[5 + j*4 + 1] << 8));
-                    uint16_t y = (uint16_t)(in[5 + j*4 + 2] |
-                                   (in[5 + j*4 + 3] << 8));
-                    out->dpi.stage[j].x_cpi = x * 100;
-                    out->dpi.stage[j].y_cpi = y * 100;
-                }
-                got |= GOT_DPI;
-            }
-            break;
-        case 0x14:
-            if (in[3] == 0x12) {
-                for (int j = 0; j < SC360SE_NSTAGES; j++) {
-                    out->dpi.stage[j].r    = in[4 + j*3];
-                    out->dpi.stage[j].g    = in[4 + j*3 + 1];
-                    out->dpi.stage[j].b    = in[4 + j*3 + 2];
-                    out->dpi.stage[j].flag = in[22 + j];
-                }
-                got |= GOT_COLORS;
-            }
-            break;
-        case 0x17:
-            if (in[3] == 0x05) {
-                out->sleep_seconds = (uint16_t)(in[4] | (in[5] << 8));
-                got |= GOT_SLEEP;
-            }
-            break;
+            rc = sc360se_recv(dev, in, left);
+            if (rc == -ETIMEDOUT) break;
+            if (rc < 0) return rc;
+            parse_config_reply(dev, out, in, &got);
+            if ((got & READ_NEED) == READ_NEED) return 0;
         }
     }
 
-    const unsigned need = GOT_BUTTONS | GOT_POLLING | GOT_DPI | GOT_COLORS | GOT_SLEEP;
+    rc = collect_replies(dev, out, &got, 500);
+    if (rc < 0) return rc;
+
+    for (int attempt = 0; attempt < 2 && (got & READ_NEED) != READ_NEED; attempt++) {
+        if ((rc = resend_missing_query(dev, out, &got, GOT_BUTTONS, 0x11)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_POLLING, 0x12)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_DPI,     0x13)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_COLORS,  0x14)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_SLEEP,   0x17)) < 0) return rc;
+    }
+
+    if ((got & READ_NEED) == READ_NEED) return 0;
+
+    const unsigned need = READ_NEED;
     if ((got & need) != need) {
         if (debug_enabled()) {
             fprintf(stderr,
