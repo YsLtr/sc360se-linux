@@ -10,6 +10,21 @@
 #include <string.h>
 #include <unistd.h>
 
+static int debug_enabled(void)
+{
+    const char *v = getenv("SC360SE_DEBUG");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static void dump_frame(const char *tag, const uint8_t *frame)
+{
+    if (!debug_enabled()) return;
+    fprintf(stderr, "[sc360se] %s", tag);
+    for (int i = 0; i < SC360SE_FRAME_LEN; i++)
+        fprintf(stderr, " %02x", frame[i]);
+    fprintf(stderr, "\n");
+}
+
 static int read_sysfs(const char *path, char *buf, size_t len)
 {
     int fd = open(path, O_RDONLY);
@@ -105,6 +120,7 @@ int sc360se_send(struct sc360se_device *dev, uint8_t *frame)
 {
     /* Frame[31] is the checksum slot — stamp it before sending. */
     frame[SC360SE_FRAME_LEN - 1] = sc360se_checksum(frame);
+    dump_frame("TX", frame);
 
     /* hidraw expects the report ID in byte[0]. The SC360SE uses report-id=0
      * (numbered reports disabled), so we prepend a zero byte and write 33. */
@@ -134,6 +150,7 @@ int sc360se_recv(struct sc360se_device *dev, uint8_t *frame, int timeout_ms)
     ssize_t n = read(dev->fd, frame, SC360SE_FRAME_LEN);
     if (n < 0) return -errno;
     if (n != SC360SE_FRAME_LEN) return -EIO;
+    dump_frame("RX", frame);
     return 0;
 }
 
@@ -144,14 +161,23 @@ int sc360se_try_recv(struct sc360se_device *dev, uint8_t *frame)
 
 int sc360se_xfer(struct sc360se_device *dev, uint8_t *out, uint8_t *in)
 {
+    uint8_t stale[SC360SE_FRAME_LEN];
+    for (int i = 0; i < 16; i++) {
+        int d = sc360se_try_recv(dev, stale);
+        if (d == -ETIMEDOUT) break;
+        if (d < 0) return d;
+        if (debug_enabled()) dump_frame("DRAIN", stale);
+    }
+
     int r = sc360se_send(dev, out);
     if (r < 0) return r;
     if (!in) return 0;
-    /* Drain any stray packets first; reply is on EP 0x84 within ~1ms. */
+    /* Reply is on EP 0x84 within ~1ms; ignore unrelated async events. */
     for (int tries = 0; tries < 8; tries++) {
         r = sc360se_recv(dev, in, 50);
         if (r < 0) return r;
         if (in[0] == out[0]) return 0;          /* matching reply */
+        if (debug_enabled()) dump_frame("IGNORE", in);
     }
     return -EIO;
 }

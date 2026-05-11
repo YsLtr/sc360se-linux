@@ -28,7 +28,15 @@
 #include "sc360se.h"
 
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+static int debug_enabled(void)
+{
+    const char *v = getenv("SC360SE_DEBUG");
+    return v && *v && strcmp(v, "0") != 0;
+}
 
 static void frame_init(uint8_t *f, uint8_t op, uint8_t ns, uint8_t sub)
 {
@@ -229,6 +237,20 @@ static int query(struct sc360se_device *dev, uint8_t op, uint8_t *reply)
     return sc360se_xfer(dev, out, reply);
 }
 
+static int query_with_retries(struct sc360se_device *dev, uint8_t op, uint8_t *reply)
+{
+    int rc = 0;
+    for (int i = 0; i < 3; i++) {
+        rc = query(dev, op, reply);
+        if (rc < 0) return rc;
+        if (reply[1] != 0x02) return 0;
+        if (debug_enabled())
+            fprintf(stderr, "[sc360se] query 0x%02x returned error reply; retry %d/3\n",
+                    op, i + 1);
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Read full current config from device                               */
 /*                                                                    */
@@ -242,6 +264,15 @@ int sc360se_read_config(struct sc360se_device *dev,
 {
     uint8_t in[SC360SE_FRAME_LEN];
     int rc;
+    unsigned got = 0;
+
+    enum {
+        GOT_BUTTONS = 1u << 0,
+        GOT_POLLING = 1u << 1,
+        GOT_DPI     = 1u << 2,
+        GOT_COLORS  = 1u << 3,
+        GOT_SLEEP   = 1u << 4,
+    };
 
     sc360se_profile_default(out);
 
@@ -249,9 +280,24 @@ int sc360se_read_config(struct sc360se_device *dev,
                                   0x14, 0x15, 0x16, 0x17, 0x20};
 
     for (size_t i = 0; i < sizeof(seq); i++) {
-        rc = query(dev, seq[i], in);
+        rc = query_with_retries(dev, seq[i], in);
         if (rc == -ETIMEDOUT) { rc = 0; continue; }
         if (rc < 0) return rc;
+
+        if (seq[i] == 0x10 && in[3] == 0x0b && in[14] == 0x00) {
+            if (debug_enabled())
+                fprintf(stderr,
+                        "[sc360se] dongle reports mouse not ready/asleep "
+                        "(0x10 reply byte[14]=00); wake/move/click the mouse\n");
+            return -EHOSTDOWN;
+        }
+
+        if (in[1] == 0x02) {
+            if (debug_enabled())
+                fprintf(stderr, "[sc360se] query 0x%02x failed with device error reply\n",
+                        seq[i]);
+            continue;
+        }
 
         switch (seq[i]) {
         case 0x10:
@@ -268,11 +314,14 @@ int sc360se_read_config(struct sc360se_device *dev,
                     out->buttons[j].p1 = in[4 + j*3 + 1];
                     out->buttons[j].p2 = in[4 + j*3 + 2];
                 }
+                got |= GOT_BUTTONS;
             }
             break;
         case 0x12:
-            if (in[3] == 0x01)
+            if (in[3] == 0x01) {
                 out->polling = (enum sc360se_polling_rate)in[4];
+                got |= GOT_POLLING;
+            }
             break;
         case 0x13:
             if (in[3] == 0x19) {
@@ -286,6 +335,7 @@ int sc360se_read_config(struct sc360se_device *dev,
                     out->dpi.stage[j].x_cpi = x * 100;
                     out->dpi.stage[j].y_cpi = y * 100;
                 }
+                got |= GOT_DPI;
             }
             break;
         case 0x14:
@@ -296,13 +346,32 @@ int sc360se_read_config(struct sc360se_device *dev,
                     out->dpi.stage[j].b    = in[4 + j*3 + 2];
                     out->dpi.stage[j].flag = in[22 + j];
                 }
+                got |= GOT_COLORS;
             }
             break;
         case 0x17:
-            if (in[3] == 0x05)
+            if (in[3] == 0x05) {
                 out->sleep_seconds = (uint16_t)(in[4] | (in[5] << 8));
+                got |= GOT_SLEEP;
+            }
             break;
         }
+    }
+
+    const unsigned need = GOT_BUTTONS | GOT_POLLING | GOT_DPI | GOT_COLORS | GOT_SLEEP;
+    if ((got & need) != need) {
+        if (debug_enabled()) {
+            fprintf(stderr,
+                    "[sc360se] incomplete read_config: got=0x%02x need=0x%02x"
+                    " missing:%s%s%s%s%s\n",
+                    got, need,
+                    (got & GOT_BUTTONS) ? "" : " buttons",
+                    (got & GOT_POLLING) ? "" : " polling",
+                    (got & GOT_DPI)     ? "" : " dpi",
+                    (got & GOT_COLORS)  ? "" : " colors",
+                    (got & GOT_SLEEP)   ? "" : " sleep");
+        }
+        return -ENODATA;
     }
     return 0;
 }

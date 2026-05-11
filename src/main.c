@@ -407,7 +407,16 @@ int main(int argc, char **argv)
     else { usage(argv[0]); r = -EINVAL; }
 
 out:
-    if (r < 0) fprintf(stderr, "error: %s\n", strerror(-r));
+    if (r == -EHOSTDOWN)
+        fprintf(stderr,
+                "error: 2.4G receiver is reachable, but the mouse is not ready "
+                "for config readback. Move/click/wake the mouse, then retry.\n");
+    else if (r == -ENODATA)
+        fprintf(stderr,
+                "error: incomplete config readback; device returned no usable "
+                "buttons/polling/DPI/colors/sleep data.\n");
+    else if (r < 0)
+        fprintf(stderr, "error: %s\n", strerror(-r));
     sc360se_close(&dev);
     return r ? 1 : 0;
 }

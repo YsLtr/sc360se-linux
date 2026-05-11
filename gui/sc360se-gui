@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,13 +26,21 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+
+def debug(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[sc360se-gui {ts}] {msg}", file=sys.stderr, flush=True)
 
 def find_cli() -> Path:
-    local = HERE / "sc360se"
+    # Prefer the freshly-built binary in the project root
+    local = ROOT / "sc360se"
     if local.exists() and os.access(local, os.X_OK):
+        debug(f"using CLI from source tree: {local}")
         return local
     sys_ = shutil.which("sc360se")
     if sys_:
+        debug(f"using CLI from PATH: {sys_}")
         return Path(sys_)
     raise FileNotFoundError("sc360se binary not found (build it first or add to PATH)")
 
@@ -39,13 +48,31 @@ class CliError(RuntimeError):
     pass
 
 def run_cli(cli: Path, *args, timeout=15) -> str:
+    cmd = " ".join([str(cli), *args])
+    debug(f"RUN {cmd}")
+    env = os.environ.copy()
+    env.setdefault("SC360SE_DEBUG", "1")
     try:
         r = subprocess.run([str(cli), *args],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env=env)
     except subprocess.TimeoutExpired as e:
+        debug(f"TIMEOUT {cmd}")
         raise CliError(f"timeout running: sc360se {' '.join(args)}") from e
+    stdout = (r.stdout or "").strip()
+    stderr = (r.stderr or "").strip()
+    debug(f"EXIT {r.returncode} {cmd}")
+    if stdout:
+        debug("STDOUT\n" + stdout)
+    if stderr:
+        debug("STDERR\n" + stderr)
     if r.returncode != 0:
-        msg = (r.stderr or r.stdout or "unknown error").strip()
+        combined = [line.strip() for line in (stderr + "\n" + stdout).splitlines()
+                    if line.strip()]
+        msg = next((line for line in reversed(combined)
+                    if line.startswith("error:")), None)
+        if msg is None:
+            msg = (stderr or stdout or "unknown error").strip()
         raise CliError(msg)
     return r.stdout
 
@@ -73,6 +100,12 @@ ACTION_TYPES = [
     ("key",      "Keyboard key"),
     ("consumer", "Media key"),
 ]
+
+# Map action type name → wire byte (matches sc360se_action_type enum)
+ACTION_TYPE_CODE = {t: c for t, c in [
+    ("mouse", 0x10), ("dpi", 0x40), ("disable", 0x60),
+    ("key", 0x70), ("consumer", 0x80),
+]}
 
 MOUSE_BUTTONS = [(0x01, "Left"), (0x02, "Right"), (0x04, "Middle"),
                  (0x08, "Forward"), (0x10, "Back")]
@@ -202,6 +235,9 @@ class Profile:
     def from_device_text(cls, text: str):
         """Parse the output of `sc360se read` into a Profile."""
         p = cls.default()
+        seen = set()
+        stage_seen = set()
+        button_seen = set()
         for raw in text.splitlines():
             line = raw.strip()
             if not line or ":" not in line:
@@ -210,12 +246,16 @@ class Profile:
             k, v = k.strip(), v.strip()
             if k == "polling":
                 p.polling = int(v.split()[0])
+                seen.add("polling")
             elif k == "sleep":
                 p.sleep_seconds = int(v.rstrip("s").strip())
+                seen.add("sleep")
             elif k == "dpi.active":
                 p.dpi_active = int(v)
+                seen.add("dpi.active")
             elif k == "dpi.count":
                 p.dpi_count = int(v)
+                seen.add("dpi.count")
             elif k.startswith("dpi["):
                 m = re.match(r"dpi\[(\d+)\]", k)
                 if not m: continue
@@ -227,6 +267,7 @@ class Profile:
                 p.stages[idx].y_cpi = int(m2.group(2))
                 p.stages[idx].rgb   = "#" + m2.group(3).upper()
                 p.stages[idx].flag  = int(m2.group(4), 16)
+                stage_seen.add(idx)
             elif k.startswith("button["):
                 m = re.match(r"button\[(\d+)", k)
                 if not m: continue
@@ -237,6 +278,16 @@ class Profile:
                 p.buttons[idx].type = parts[0]
                 p.buttons[idx].p1 = int(parts[1], 16)
                 p.buttons[idx].p2 = int(parts[2], 16)
+                button_seen.add(idx)
+
+        missing = []
+        for name in ("polling", "sleep", "dpi.active", "dpi.count"):
+            if name not in seen:
+                missing.append(name)
+        missing.extend(f"dpi[{i}]" for i in range(NSTAGES) if i not in stage_seen)
+        missing.extend(f"button[{i}]" for i in range(NBUTTONS) if i not in button_seen)
+        if missing:
+            raise ValueError("incomplete device read; missing " + ", ".join(missing))
         return p
 
     def save(self, path: Path):
@@ -277,6 +328,15 @@ def rgb_tuple_to_hex(r: int, g: int, b: int) -> str:
                               max(0, min(255, g)),
                               max(0, min(255, b)))
 
+def profile_summary(p: Profile) -> str:
+    dpi = ", ".join(f"{i}:{s.x_cpi}/{s.y_cpi} {s.rgb} f={s.flag:02x}"
+                    for i, s in enumerate(p.stages))
+    buttons = ", ".join(f"{i}:{b.type}/{b.p1:02x}/{b.p2:02x}"
+                        for i, b in enumerate(p.buttons))
+    return (f"polling={p.polling} sleep={p.sleep_seconds} "
+            f"active={p.dpi_active} count={p.dpi_count} "
+            f"dpi=[{dpi}] buttons=[{buttons}]")
+
 # ─────────────────────────────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────────────────────────────
@@ -299,9 +359,16 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         self.profiles_dir = profiles_dir
         self.profile = Profile.default()
         self._guard = False  # stop signal feedback during programmatic UI sync
+        self._guard_depth = 0
+        self._write_enabled = False
+        self._startup_refresh_done = False
+        self._debounce_src = None
+        self._enable_writes_src = None
         self._watch_proc = None
         self._watch_tag = None
+        self._watch_err_tag = None
         self.connect("close-request", self._on_close)
+        debug(f"window init: profiles_dir={profiles_dir}")
 
         # CSS
         prov = Gtk.CssProvider()
@@ -348,6 +415,14 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         # Initial state
         self.sync_ui_from_profile()
+        self.connect("map", self._on_map)
+
+    def _on_map(self, *_):
+        if self._startup_refresh_done:
+            debug("map: startup refresh already done; ignoring duplicate map signal")
+            return
+        self._startup_refresh_done = True
+        debug("map: window mapped; scheduling startup refresh")
         GLib.idle_add(self.refresh_device)
 
     # ─── sections ─────────────────────────────────────────────────
@@ -448,22 +523,26 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         def on_spin(_w):
             v = snap_dpi(int(spin.get_value()))
             if not self._guard:
+                debug(f"stage {i} spin changed: {v}")
                 self.profile.stages[i].x_cpi = v
                 self.profile.stages[i].y_cpi = v
                 self._debounce(self._write_dpi)
+            was_guard = self._guard
             self._guard = True
             spin.set_value(v); slider.set_value(v)
-            self._guard = False
+            self._guard = was_guard
 
         def on_slider(_w):
             v = snap_dpi(int(slider.get_value()))
             if not self._guard:
+                debug(f"stage {i} slider changed: {v}")
                 self.profile.stages[i].x_cpi = v
                 self.profile.stages[i].y_cpi = v
                 self._debounce(self._write_dpi)
+            was_guard = self._guard
             self._guard = True
             spin.set_value(v); slider.set_value(v)
-            self._guard = False
+            self._guard = was_guard
 
         spin.connect("value-changed", on_spin)
         slider.connect("value-changed", on_slider)
@@ -499,6 +578,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                     int(r_spin.get_value()),
                     int(g_spin.get_value()),
                     int(b_spin.get_value()))
+                debug(f"stage {i} RGB changed: {self.profile.stages[i].rgb}")
                 self._debounce(self._write_colors)
             preview.queue_draw()
         r_spin.connect("value-changed", on_rgb)
@@ -513,6 +593,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         def on_led(_w):
             if not self._guard:
                 self.profile.stages[i].flag = 0xff if led_chk.get_active() else 0x00
+                debug(f"stage {i} LED flag changed: {self.profile.stages[i].flag:02x}")
                 self._write_colors()
         led_chk.connect("toggled", on_led)
         b.append(led_chk)
@@ -673,12 +754,48 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
     # ─── state plumbing ────────────────────────────────────────────
 
+    def _enter_guard(self, reason: str):
+        self._guard_depth += 1
+        debug(f"guard enter({self._guard_depth}): {reason}")
+        self._guard = True
+
+    def _leave_guard_later(self, reason: str):
+        debug(f"guard release scheduled: {reason}")
+        GLib.idle_add(self._clear_guard, reason)
+
+    def _write_allowed(self, name: str) -> bool:
+        if self._guard:
+            debug(f"SKIP WRITE {name}: guard active")
+            return False
+        if not self._write_enabled:
+            debug(f"SKIP WRITE {name}: device writes disabled until a complete read succeeds")
+            return False
+        return True
+
+    def _enable_writes_later(self, reason: str, ms=300):
+        if self._enable_writes_src:
+            GLib.source_remove(self._enable_writes_src)
+        debug(f"device writes will be enabled in {ms} ms: {reason}")
+        self._enable_writes_src = GLib.timeout_add(ms, self._enable_writes, reason)
+
+    def _enable_writes(self, reason: str):
+        self._enable_writes_src = None
+        if self._guard:
+            debug(f"device writes not enabled yet; guard still active: {reason}")
+            self._enable_writes_later(reason, 100)
+            return False
+        self._write_enabled = True
+        debug(f"device writes enabled: {reason}")
+        return False
+
     def _sync_field(self, attr, value):
         if not self._guard:
+            debug(f"sync field from UI: {attr}={value}")
             setattr(self.profile, attr, value)
 
     def _set_button(self, idx, type_name, p1, p2):
         if self._guard: return
+        debug(f"button UI changed: idx={idx} type={type_name} p1={p1:02x} p2={p2:02x}")
         self.profile.buttons[idx].type = type_name
         self.profile.buttons[idx].p1 = p1
         self.profile.buttons[idx].p2 = p2
@@ -699,8 +816,16 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             (row["box"].remove_css_class("disabled") if on
              else row["box"].add_css_class("disabled"))
 
+    def _clear_guard(self, reason=""):
+        if self._guard_depth > 0:
+            self._guard_depth -= 1
+        self._guard = self._guard_depth > 0
+        debug(f"guard leave({self._guard_depth}): {reason}")
+        return False
+
     def sync_ui_from_profile(self):
-        self._guard = True
+        self._enter_guard("sync_ui_from_profile")
+        debug("sync UI from profile: " + profile_summary(self.profile))
         try:
             # polling
             try:
@@ -745,23 +870,22 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                     j = next((k for k,(u,_) in enumerate(CONSUMER_KEYS) if u == usage), 0)
                     row["c"].set_selected(j)
         finally:
-            self._guard = False
-
-    # ─── profiles ──────────────────────────────────────────────────
+            self._leave_guard_later("sync_ui_from_profile")
 
     def _profile_paths(self):
         return sorted(self.profiles_dir.glob("*.cfg"))
 
     def _reload_profile_list(self):
-        self._guard = True
+        self._enter_guard("reload_profile_list")
         try:
             files = self._profile_paths()
+            debug("reload profile list: " + ", ".join(str(f) for f in files))
             names = [f.stem for f in files] or ["(no profiles)"]
             sm = Gtk.StringList.new(names)
             self.profile_combo.set_model(sm)
             self.profile_combo.set_sensitive(bool(files))
         finally:
-            self._guard = False
+            self._leave_guard_later("reload_profile_list")
 
     def _on_profile_selected(self):
         if self._guard: return
@@ -829,10 +953,24 @@ class Sc360seWindow(Gtk.ApplicationWindow):
     # ─── device ────────────────────────────────────────────────────
 
     def refresh_device(self):
+        debug("refresh_device: begin")
+        self._write_enabled = False
+        debug("device writes disabled during refresh")
+        if self._enable_writes_src:
+            debug("cancelling pending write-enable timer before refresh")
+            GLib.source_remove(self._enable_writes_src)
+            self._enable_writes_src = None
+        if self._debounce_src:
+            debug("cancelling pending debounced write before refresh")
+            GLib.source_remove(self._debounce_src)
+            self._debounce_src = None
         try:
             out = run_cli(self.cli, "read")
-            self.profile = Profile.from_device_text(out)
+            loaded = Profile.from_device_text(out)
+            debug("refresh_device: parsed complete device profile: " + profile_summary(loaded))
+            self.profile = loaded
             self.sync_ui_from_profile()
+            self._enable_writes_later("successful complete device read")
 
             self.dot.remove_css_class("muted")
             self.dot.remove_css_class("error")
@@ -848,39 +986,68 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             self.status_label.set_text("  ·  ".join(info_parts))
 
             self._start_watch()
-        except (CliError, FileNotFoundError) as e:
+        except (CliError, FileNotFoundError, ValueError) as e:
+            debug(f"refresh_device: failed: {e}")
             self.dot.remove_css_class("success")
             self.dot.add_css_class("error")
             self.status_label.set_text(f"Not connected: {e}")
             self.battery_label.set_text("")
+            self._write_enabled = False
+            if self._enable_writes_src:
+                GLib.source_remove(self._enable_writes_src)
+                self._enable_writes_src = None
+            debug("device writes remain disabled because refresh failed")
         return False
 
     def _start_watch(self):
         """Spawn `sc360se watch` as a background subprocess to receive
         unsolicited DPI-change and battery notifications from the mouse."""
         if hasattr(self, '_watch_proc') and self._watch_proc is not None:
+            debug("watch: already running")
             return
         try:
+            debug(f"watch: starting {self.cli} watch")
+            env = os.environ.copy()
+            env.setdefault("SC360SE_DEBUG", "1")
             self._watch_proc = subprocess.Popen(
                 [str(self.cli), "watch"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env,
                 text=True, bufsize=1)
             self._watch_tag = GLib.io_add_watch(
                 self._watch_proc.stdout,
                 GLib.IO_IN | GLib.IO_HUP,
                 self._on_watch_output)
-        except Exception:
-            pass
+            self._watch_err_tag = GLib.io_add_watch(
+                self._watch_proc.stderr,
+                GLib.IO_IN | GLib.IO_HUP,
+                self._on_watch_stderr)
+        except Exception as e:
+            debug(f"watch: failed to start: {e}")
+
+    def _on_watch_stderr(self, source, condition):
+        if condition & GLib.IO_HUP:
+            self._watch_err_tag = None
+            return False
+        line = source.readline()
+        if not line:
+            self._watch_err_tag = None
+            return False
+        debug("watch stderr: " + line.rstrip())
+        return True
 
     def _on_watch_output(self, source, condition):
         if condition & GLib.IO_HUP:
+            debug("watch: HUP")
             self._stop_watch()
             return False
         line = source.readline()
         if not line:
+            debug("watch: EOF")
             self._stop_watch()
             return False
         line = line.strip()
+        debug(f"watch: {line}")
         # dpi: stage 2/6 → 2400 cpi
         if line.startswith("dpi: stage "):
             import re
@@ -889,11 +1056,11 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                 active = int(m.group(1))
                 if active != self.profile.dpi_active:
                     self.profile.dpi_active = active
-                    self._guard = True
+                    self._enter_guard("watch dpi event")
                     try:
                         self.dpi_active_combo.set_selected(active)
                     finally:
-                        self._guard = False
+                        self._leave_guard_later("watch dpi event")
         # battery: 92%
         elif line.startswith("battery: "):
             pct = line.split(": ", 1)[1].rstrip("%")
@@ -902,14 +1069,21 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
     def _stop_watch(self):
         if hasattr(self, '_watch_tag') and self._watch_tag:
+            debug("watch: removing GLib source")
             GLib.source_remove(self._watch_tag)
             self._watch_tag = None
+        if hasattr(self, '_watch_err_tag') and self._watch_err_tag:
+            debug("watch: removing stderr GLib source")
+            GLib.source_remove(self._watch_err_tag)
+            self._watch_err_tag = None
         if hasattr(self, '_watch_proc') and self._watch_proc:
             try:
+                debug("watch: terminating subprocess")
                 self._watch_proc.terminate()
                 self._watch_proc.wait(timeout=2)
             except Exception:
                 try:
+                    debug("watch: killing subprocess")
                     self._watch_proc.kill()
                 except Exception:
                     pass
@@ -924,45 +1098,65 @@ class Sc360seWindow(Gtk.ApplicationWindow):
     def _debounce(self, callback, ms=250):
         """Debounce rapid-fire changes (sliders etc.) before writing."""
         if hasattr(self, '_debounce_src') and self._debounce_src:
+            debug("debounce: replacing pending write")
             GLib.source_remove(self._debounce_src)
+        debug(f"debounce: scheduling {callback.__name__} in {ms} ms")
         self._debounce_src = GLib.timeout_add(ms, self._run_debounced, callback)
 
     def _run_debounced(self, callback):
         self._debounce_src = None
+        debug(f"debounce: running {callback.__name__}")
         try:
             callback()
-        except CliError:
-            pass
+        except CliError as e:
+            debug(f"debounce: {callback.__name__} failed: {e}")
+        return False
 
     def _write_dpi(self):
+        if not self._write_allowed("dpi"):
+            return
         p = self.profile
         parts = [str(p.dpi_active), str(p.dpi_count)]
         for s in p.stages:
             parts.append(f"{s.x_cpi}/{s.y_cpi}")
+        debug("WRITE dpi: " + " ".join(parts))
         run_cli(self.cli, "dpi", *parts, timeout=5)
         run_cli(self.cli, "commit")
 
     def _write_colors(self):
+        if not self._write_allowed("colors"):
+            return
         p = self.profile
         parts = []
         for s in p.stages:
             r, g, b = rgb_hex_to_tuple(s.rgb)
             parts.append(f"{r:02x}/{g:02x}/{b:02x}/{s.flag:02x}")
+        debug("WRITE colors: " + " ".join(parts))
         run_cli(self.cli, "write-colors", *parts, timeout=5)
         run_cli(self.cli, "commit")
 
     def _write_buttons(self):
+        if not self._write_allowed("buttons"):
+            return
         parts = []
         for b in self.profile.buttons:
-            parts.append(f"{b.type:02x}/{b.p1:02x}/{b.p2:02x}")
+            tc = ACTION_TYPE_CODE.get(b.type, 0)
+            parts.append(f"{tc:02x}/{b.p1:02x}/{b.p2:02x}")
+        debug("WRITE buttons: " + " ".join(parts))
         run_cli(self.cli, "write-buttons", *parts, timeout=5)
         run_cli(self.cli, "commit")
 
     def _write_polling(self):
+        if not self._write_allowed("polling"):
+            return
+        debug(f"WRITE polling: {self.profile.polling}")
         run_cli(self.cli, "polling", str(self.profile.polling))
         run_cli(self.cli, "commit")
 
     def _write_sleep(self):
+        if not self._write_allowed("sleep"):
+            return
+        debug(f"WRITE sleep: {self.profile.sleep_seconds}")
         run_cli(self.cli, "sleep", str(self.profile.sleep_seconds))
         run_cli(self.cli, "commit")
 
