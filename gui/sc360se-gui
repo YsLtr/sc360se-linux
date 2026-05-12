@@ -12,6 +12,9 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Gdk, GLib, Gio
 
+import cairo
+import colorsys
+import math
 import os
 import re
 import shutil
@@ -368,6 +371,9 @@ CSS = b"""
 .error        { color: #e01b24; }
 .stage-row    { padding: 6px; border-radius: 6px; }
 .stage-row.disabled { opacity: 0.4; }
+.color-button { padding: 4px 8px; }
+.color-hex    { font-family: monospace; }
+.swatch-button { padding: 2px; min-width: 0; min-height: 0; }
 """
 
 class Sc360seWindow(Gtk.ApplicationWindow):
@@ -570,10 +576,6 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         r_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
         g_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
         b_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
-        for text, w in (("R", r_spin), ("G", g_spin), ("B", b_spin)):
-            rgb_box.append(Gtk.Label(label=text))
-            w.set_size_request(66, -1)
-            rgb_box.append(w)
 
         preview = Gtk.DrawingArea()
         preview.set_content_width(36)
@@ -589,20 +591,256 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             cr.rectangle(0.5, 0.5, max(0, width - 1), max(0, height - 1))
             cr.stroke()
         preview.set_draw_func(draw_preview)
-        rgb_box.append(preview)
 
-        def on_rgb(*_):
-            if not self._guard:
-                self.profile.stages[i].rgb = rgb_tuple_to_hex(
-                    int(r_spin.get_value()),
-                    int(g_spin.get_value()),
-                    int(b_spin.get_value()))
-                debug(f"stage {i} RGB changed: {self.profile.stages[i].rgb}")
-                self._debounce(self._write_colors)
+        color_label = Gtk.Label(label=self.profile.stages[i].rgb)
+        color_label.add_css_class("color-hex")
+        color_label.set_size_request(76, -1)
+
+        color_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        color_button_box.append(preview)
+        color_button_box.append(color_label)
+
+        color_button = Gtk.MenuButton()
+        color_button.add_css_class("color-button")
+        color_button.set_tooltip_text("Open RGB color picker")
+        color_button.set_child(color_button_box)
+
+        popover = Gtk.Popover()
+        popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                              margin_start=10, margin_end=10,
+                              margin_top=10, margin_bottom=10)
+
+        sv_area = Gtk.DrawingArea()
+        sv_area.set_content_width(320)
+        sv_area.set_content_height(180)
+        sv_area.set_tooltip_text("Saturation and brightness")
+        popover_box.append(sv_area)
+
+        hue_area = Gtk.DrawingArea()
+        hue_area.set_content_width(320)
+        hue_area.set_content_height(22)
+        hue_area.set_tooltip_text("Hue")
+        popover_box.append(hue_area)
+
+        swatch_grid = Gtk.Grid(column_spacing=4, row_spacing=4,
+                               halign=Gtk.Align.CENTER)
+        popover_box.append(swatch_grid)
+
+        exact_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        exact_row.append(Gtk.Label(label="RGB"))
+        for text, w in (("R", r_spin), ("G", g_spin), ("B", b_spin)):
+            exact_row.append(Gtk.Label(label=text))
+            w.set_size_request(68, -1)
+            exact_row.append(w)
+        popover_box.append(exact_row)
+        popover.set_child(popover_box)
+        color_button.set_popover(popover)
+        rgb_box.append(color_button)
+
+        color_guard = {"active": False}
+        color_state = {"h": 0.0, "s": 0.0, "v": 1.0}
+        sv_drag_start = {"x": 0.0, "y": 0.0}
+        hue_drag_start = {"x": 0.0}
+
+        def clamp01(value):
+            return max(0.0, min(1.0, value))
+
+        def picker_rgb():
+            r, g, bb = colorsys.hsv_to_rgb(color_state["h"],
+                                           color_state["s"],
+                                           color_state["v"])
+            return round(r * 255), round(g * 255), round(bb * 255)
+
+        def update_picker_from_rgb(r, g, bb):
+            h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, bb / 255.0)
+            if s > 0.001:
+                color_state["h"] = h
+            color_state["s"] = s
+            color_state["v"] = v
+
+        def queue_picker_draw():
             preview.queue_draw()
-        r_spin.connect("value-changed", on_rgb)
-        g_spin.connect("value-changed", on_rgb)
-        b_spin.connect("value-changed", on_rgb)
+            sv_area.queue_draw()
+            hue_area.queue_draw()
+
+        def draw_sv(_area, cr, width, height):
+            hue_r, hue_g, hue_b = colorsys.hsv_to_rgb(color_state["h"], 1.0, 1.0)
+            sat = cairo.LinearGradient(0, 0, max(1, width), 0)
+            sat.add_color_stop_rgb(0, 1, 1, 1)
+            sat.add_color_stop_rgb(1, hue_r, hue_g, hue_b)
+            cr.set_source(sat)
+            cr.rectangle(0, 0, width, height)
+            cr.fill()
+
+            val = cairo.LinearGradient(0, 0, 0, max(1, height))
+            val.add_color_stop_rgba(0, 0, 0, 0, 0)
+            val.add_color_stop_rgba(1, 0, 0, 0, 1)
+            cr.set_source(val)
+            cr.rectangle(0, 0, width, height)
+            cr.fill()
+
+            x = color_state["s"] * max(1, width - 1)
+            y = (1.0 - color_state["v"]) * max(1, height - 1)
+            cr.set_line_width(2)
+            cr.set_source_rgb(1, 1, 1)
+            cr.arc(x, y, 6, 0, math.tau)
+            cr.stroke_preserve()
+            cr.set_source_rgba(0, 0, 0, 0.75)
+            cr.stroke()
+
+        def draw_hue(_area, cr, width, height):
+            hue = cairo.LinearGradient(0, 0, max(1, width), 0)
+            stops = [
+                (0.0, (1, 0, 0)),
+                (1 / 6, (1, 1, 0)),
+                (2 / 6, (0, 1, 0)),
+                (3 / 6, (0, 1, 1)),
+                (4 / 6, (0, 0, 1)),
+                (5 / 6, (1, 0, 1)),
+                (1.0, (1, 0, 0)),
+            ]
+            for pos, (r, g, bb) in stops:
+                hue.add_color_stop_rgb(pos, r, g, bb)
+            cr.set_source(hue)
+            cr.rectangle(0, 0, width, height)
+            cr.fill()
+            x = color_state["h"] * max(1, width - 1)
+            cr.set_line_width(3)
+            cr.set_source_rgb(1, 1, 1)
+            cr.move_to(x, 0)
+            cr.line_to(x, height)
+            cr.stroke_preserve()
+            cr.set_line_width(1)
+            cr.set_source_rgba(0, 0, 0, 0.7)
+            cr.move_to(x, 0)
+            cr.line_to(x, height)
+            cr.stroke()
+
+        sv_area.set_draw_func(draw_sv)
+        hue_area.set_draw_func(draw_hue)
+
+        def sync_color_widgets(rgb_hex=None):
+            rgb = rgb_hex or self.profile.stages[i].rgb
+            r, g, bb = rgb_hex_to_tuple(rgb)
+            color_guard["active"] = True
+            try:
+                r_spin.set_value(r)
+                g_spin.set_value(g)
+                b_spin.set_value(bb)
+                update_picker_from_rgb(r, g, bb)
+                color_label.set_text(rgb_tuple_to_hex(r, g, bb))
+            finally:
+                color_guard["active"] = False
+            queue_picker_draw()
+
+        def set_stage_rgb(r, g, bb, source):
+            if color_guard["active"]:
+                return
+            rgb = rgb_tuple_to_hex(r, g, bb)
+            if not self._guard and self.profile.stages[i].rgb != rgb:
+                self.profile.stages[i].rgb = rgb
+                debug(f"stage {i} RGB changed from {source}: {rgb}")
+                self._debounce(self._write_colors)
+            sync_color_widgets(rgb)
+
+        def set_from_sv_point(x, y):
+            width = max(1, sv_area.get_width() - 1)
+            height = max(1, sv_area.get_height() - 1)
+            color_state["s"] = clamp01(x / width)
+            color_state["v"] = clamp01(1.0 - (y / height))
+            set_stage_rgb(*picker_rgb(), "color-space")
+
+        def set_from_hue_point(x):
+            width = max(1, hue_area.get_width() - 1)
+            color_state["h"] = clamp01(x / width)
+            if color_state["s"] <= 0.001:
+                color_state["s"] = 1.0
+            if color_state["v"] <= 0.001:
+                color_state["v"] = 1.0
+            set_stage_rgb(*picker_rgb(), "hue")
+
+        def on_rgb_spin(*_):
+            set_stage_rgb(int(r_spin.get_value()),
+                          int(g_spin.get_value()),
+                          int(b_spin.get_value()),
+                          "numeric")
+
+        def on_sv_pressed(_gesture, _n_press, x, y):
+            set_from_sv_point(x, y)
+
+        def on_sv_drag_begin(_gesture, x, y):
+            sv_drag_start["x"] = x
+            sv_drag_start["y"] = y
+            set_from_sv_point(x, y)
+
+        def on_sv_drag_update(_gesture, offset_x, offset_y):
+            set_from_sv_point(sv_drag_start["x"] + offset_x,
+                              sv_drag_start["y"] + offset_y)
+
+        def on_hue_pressed(_gesture, _n_press, x, _y):
+            set_from_hue_point(x)
+
+        def on_hue_drag_begin(_gesture, x, _y):
+            hue_drag_start["x"] = x
+            set_from_hue_point(x)
+
+        def on_hue_drag_update(_gesture, offset_x, _offset_y):
+            set_from_hue_point(hue_drag_start["x"] + offset_x)
+
+        sv_click = Gtk.GestureClick()
+        sv_click.connect("pressed", on_sv_pressed)
+        sv_area.add_controller(sv_click)
+        sv_drag = Gtk.GestureDrag()
+        sv_drag.connect("drag-begin", on_sv_drag_begin)
+        sv_drag.connect("drag-update", on_sv_drag_update)
+        sv_area.add_controller(sv_drag)
+
+        hue_click = Gtk.GestureClick()
+        hue_click.connect("pressed", on_hue_pressed)
+        hue_area.add_controller(hue_click)
+        hue_drag = Gtk.GestureDrag()
+        hue_drag.connect("drag-begin", on_hue_drag_begin)
+        hue_drag.connect("drag-update", on_hue_drag_update)
+        hue_area.add_controller(hue_drag)
+
+        def make_swatch(rgb_hex):
+            swatch = Gtk.DrawingArea()
+            swatch.set_content_width(26)
+            swatch.set_content_height(22)
+            swatch.set_tooltip_text(rgb_hex)
+
+            def draw_swatch(_area, cr, width, height):
+                r, g, bb = rgb_hex_to_tuple(rgb_hex)
+                cr.set_source_rgb(r / 255.0, g / 255.0, bb / 255.0)
+                cr.rectangle(0, 0, width, height)
+                cr.fill()
+                cr.set_source_rgba(0, 0, 0, 0.45)
+                cr.rectangle(0.5, 0.5, max(0, width - 1), max(0, height - 1))
+                cr.stroke()
+
+            swatch.set_draw_func(draw_swatch)
+            btn = Gtk.Button()
+            btn.add_css_class("swatch-button")
+            btn.set_child(swatch)
+            btn.set_tooltip_text(rgb_hex)
+            btn.connect("clicked",
+                        lambda *_: set_stage_rgb(*rgb_hex_to_tuple(rgb_hex), "swatch"))
+            return btn
+
+        swatches = [
+            "#FF0000", "#FF8000", "#FFFF00", "#80FF00",
+            "#00FF00", "#00FF80", "#00FFFF", "#0080FF",
+            "#0000FF", "#8000FF", "#FF00FF", "#FF0080",
+            "#FFFFFF", "#C0C0C0", "#808080", "#404040", "#000000",
+            "#2EC27E", "#1C71D8", "#F6D32D", "#E66100", "#C061CB",
+        ]
+        for idx, rgb_hex in enumerate(swatches):
+            swatch_grid.attach(make_swatch(rgb_hex), idx % 11, idx // 11, 1, 1)
+
+        r_spin.connect("value-changed", on_rgb_spin)
+        g_spin.connect("value-changed", on_rgb_spin)
+        b_spin.connect("value-changed", on_rgb_spin)
+        sync_color_widgets()
         b.append(rgb_box)
 
         led_chk = Gtk.CheckButton(label="LED")
@@ -619,7 +857,9 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         return {"box": b, "spin": spin, "slider": slider,
                 "r": r_spin, "g": g_spin, "b": b_spin,
-                "preview": preview, "led": led_chk, "label": label}
+                "preview": preview, "color": color_button,
+                "sync_color": sync_color_widgets,
+                "led": led_chk, "label": label}
 
     def _build_buttons_section(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -877,11 +1117,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             for i, s in enumerate(self.profile.stages):
                 self.stage_rows[i]["spin"].set_value(s.x_cpi)
                 self.stage_rows[i]["slider"].set_value(s.x_cpi)
-                r, g, b = rgb_hex_to_tuple(s.rgb)
-                self.stage_rows[i]["r"].set_value(r)
-                self.stage_rows[i]["g"].set_value(g)
-                self.stage_rows[i]["b"].set_value(b)
-                self.stage_rows[i]["preview"].queue_draw()
+                self.stage_rows[i]["sync_color"](s.rgb)
                 self.stage_rows[i]["led"].set_active(s.flag == 0xff)
             self._update_stage_sensitivity()
             # buttons
