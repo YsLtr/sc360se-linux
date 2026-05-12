@@ -17,7 +17,7 @@ static void usage(const char *p)
 "  %s battery                  read battery percentage\n"
 "  %s polling   <125|250|500|1000>\n"
 "  %s dpi       <active 0-5> <count 1-6> <X1[/Y1]> ...\n"
-"               (cpi snaps to 100 below 5000, to 500 at/above 5000)\n"
+"               (cpi range 100..10000; snaps to 100 below 5000, to 500 at/above 5000)\n"
 "  %s color     <stage 0-5> <#RRGGBB>\n"
 "  %s sleep     <seconds>\n"
 "  %s light-mode <1-6|flow|breathing|static|neon|wave|off> [b5 b6 b7]\n"
@@ -67,6 +67,25 @@ static int parse_color(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)
     *r = (uint8_t)strtoul(rs, NULL, 16);
     *g = (uint8_t)strtoul(gs, NULL, 16);
     *b = (uint8_t)strtoul(bs, NULL, 16);
+    return 0;
+}
+
+static int parse_uint_arg(const char *s, unsigned *out)
+{
+    char *e = NULL;
+    unsigned long v = strtoul(s, &e, 0);
+    if (!s[0] || *e || v > SC360SE_DPI_MAX_CPI) return -EINVAL;
+    *out = (unsigned)v;
+    return 0;
+}
+
+static int parse_bounded_uint_arg(const char *s, unsigned min,
+                                  unsigned max, unsigned *out)
+{
+    char *e = NULL;
+    unsigned long v = strtoul(s, &e, 0);
+    if (!s[0] || *e || v < min || v > max) return -EINVAL;
+    *out = (unsigned)v;
     return 0;
 }
 
@@ -214,14 +233,29 @@ static int do_dpi(struct sc360se_device *dev, int argc, char **argv)
 {
     if (argc < 4) return -EINVAL;
     struct sc360se_dpi_config c = {0};
-    c.active = (uint8_t)atoi(argv[2]);
-    c.count  = (uint8_t)atoi(argv[3]);
+    unsigned active = 0, count = 0;
+    if (parse_bounded_uint_arg(argv[2], 0, SC360SE_NSTAGES - 1, &active) < 0 ||
+        parse_bounded_uint_arg(argv[3], 1, SC360SE_NSTAGES, &count) < 0)
+        return -EINVAL;
+    c.active = (uint8_t)active;
+    c.count  = (uint8_t)count;
     int n = argc - 4;
     if (n > SC360SE_NSTAGES) n = SC360SE_NSTAGES;
+    if (n < c.count) return -EINVAL;
     for (int i = 0; i < n; i++) {
         char *slash = strchr(argv[4 + i], '/');
-        int x = atoi(argv[4 + i]);
-        int y = slash ? atoi(slash + 1) : x;
+        unsigned x = 0, y = 0;
+        if (slash) *slash = 0;
+        int rc = parse_uint_arg(argv[4 + i], &x);
+        if (slash) {
+            rc = rc < 0 ? rc : parse_uint_arg(slash + 1, &y);
+            *slash = '/';
+        } else {
+            y = x;
+        }
+        if (rc < 0) return rc;
+        if (i < c.count && (x < SC360SE_DPI_MIN_CPI || y < SC360SE_DPI_MIN_CPI))
+            return -EINVAL;
         c.stage[i].x_cpi = (uint16_t)x;
         c.stage[i].y_cpi = (uint16_t)y;
         /* Color flags are not part of the 0x03 DPI frame. */

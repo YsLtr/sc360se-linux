@@ -56,11 +56,16 @@ A single-window app:
 - **Header bar** — refresh status
 - **Profile bar** — dropdown of saved profiles with Load / Save as / Delete
 - **DPI section** — active-stage selector, count spinner, 6 rows of
-  spin + slider + color picker (sliders snap to 100/500 cpi)
+  spin + slider + color picker (range 100..10000 cpi; sliders snap to
+  100/500 cpi)
 - **Buttons section** — 6 rows, each with a type dropdown that swaps
   between mouse-button / DPI / disable / keyboard / consumer parameter
   widgets
 - **Other** — polling rate (125/250/500/1000 Hz), light effect, sleep timeout
+
+Mouse-wheel scrolling over value controls and drop-downs scrolls the page
+instead of changing the focused value. Use click/drag or keyboard entry for
+intentional DPI, RGB, profile, or timeout changes.
 
 Profiles live in `~/.config/sc360se/*.cfg` (auto-seeded from the
 shipped `profile-1-default.cfg`, `profile-2-fps.cfg`,
@@ -99,6 +104,9 @@ sc360se recv 1000                          # dump next IN frame
 sc360se monitor                            # follow raw frames
 sc360se watch                              # decoded battery & DPI events
 ```
+
+DPI values are accepted only in the 100..10000 cpi range. Values still use the
+firmware granularity: 100 cpi steps below 5000, and 500 cpi steps from 5000 up.
 
 ## Wire format
 

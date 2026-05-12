@@ -96,6 +96,15 @@ int sc360se_set_dpi(struct sc360se_device *dev,
 {
     if (cfg->active >= SC360SE_NSTAGES) return -EINVAL;
     if (cfg->count == 0 || cfg->count > SC360SE_NSTAGES) return -EINVAL;
+    for (int i = 0; i < SC360SE_NSTAGES; i++) {
+        uint16_t x = cfg->stage[i].x_cpi;
+        uint16_t y = cfg->stage[i].y_cpi;
+        if (i < cfg->count &&
+            (x < SC360SE_DPI_MIN_CPI || y < SC360SE_DPI_MIN_CPI))
+            return -EINVAL;
+        if (x > SC360SE_DPI_MAX_CPI || y > SC360SE_DPI_MAX_CPI)
+            return -EINVAL;
+    }
 
     uint8_t f[SC360SE_FRAME_LEN];
     frame_init(f, 0x03, 0x01, 0x25);

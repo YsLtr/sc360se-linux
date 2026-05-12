@@ -2,6 +2,7 @@
  * compare against actual byte sequences captured from the Windows
  * driver. Anything that differs is a bug in protocol.c. */
 #include "sc360se.h"
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -66,6 +67,26 @@ int main(void)
     f[31] = sc360se_checksum(f);
     check("DPI 6-stage (5 enabled, active=1)",
           f, "030001251508000800100010001800180020002000350035003c003c00000097");
+
+    struct sc360se_device dev = { .fd = -1 };
+    struct sc360se_dpi_config dpi_bad = {0};
+    dpi_bad.active = 0;
+    dpi_bad.count = 1;
+    dpi_bad.stage[0].x_cpi = 10100;
+    dpi_bad.stage[0].y_cpi = 10100;
+    if (sc360se_set_dpi(&dev, &dpi_bad) == -EINVAL)
+        { printf("PASS: reject DPI above 10000\n"); pass++; }
+    else
+        { printf("FAIL: reject DPI above 10000\n"); fail++; }
+
+    dpi_bad.stage[0].x_cpi = 800;
+    dpi_bad.stage[0].y_cpi = 800;
+    dpi_bad.stage[1].x_cpi = 10500;
+    dpi_bad.stage[1].y_cpi = 10500;
+    if (sc360se_set_dpi(&dev, &dpi_bad) == -EINVAL)
+        { printf("PASS: reject disabled-stage DPI above 10000\n"); pass++; }
+    else
+        { printf("FAIL: reject disabled-stage DPI above 10000\n"); fail++; }
 
     /* buttons default — captured from wireshark_catch1.pdml frame #30109 */
     memset(f, 0, sizeof(f));

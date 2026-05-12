@@ -86,6 +86,8 @@ def run_cli(cli: Path, *args, timeout=15) -> str:
 POLLING_RATES = [125, 250, 500, 1000]
 NSTAGES = 6
 NBUTTONS = 6
+DPI_MIN_CPI = 100
+DPI_MAX_CPI = 10000
 
 LIGHT_MODES = [
     (1, "1 Flow"),
@@ -332,11 +334,53 @@ class Profile:
 
 def snap_dpi(value: int) -> int:
     """Match the firmware quantization: 100 below 5000, 500 from 5000 up."""
-    if value <= 100: return 100
-    if value >= 26000: value = 26000
+    if value <= DPI_MIN_CPI: return DPI_MIN_CPI
+    if value >= DPI_MAX_CPI: value = DPI_MAX_CPI
     if value < 5000:
         return (value // 100) * 100
     return (value // 500) * 500
+
+def sanitize_profile_ranges(profile: Profile):
+    profile.dpi_active = max(0, min(NSTAGES - 1, profile.dpi_active))
+    profile.dpi_count = max(1, min(NSTAGES, profile.dpi_count))
+    profile.sleep_seconds = max(0, min(65535, profile.sleep_seconds))
+    for stage in profile.stages:
+        stage.x_cpi = snap_dpi(stage.x_cpi)
+        stage.y_cpi = snap_dpi(stage.y_cpi)
+        stage.flag = max(0, min(255, stage.flag))
+
+def _scroll_adjustment(adj, delta):
+    if not adj or delta == 0:
+        return False
+    step = adj.get_step_increment()
+    if step <= 0:
+        step = 48.0
+    lower = adj.get_lower()
+    upper = adj.get_upper() - adj.get_page_size()
+    if upper < lower:
+        upper = lower
+    old = adj.get_value()
+    new = max(lower, min(upper, old + delta * step))
+    if abs(new - old) < 0.001:
+        return False
+    adj.set_value(new)
+    return True
+
+def redirect_scroll_to_page(widget, scrolled_window):
+    ctrl = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL |
+                                         Gtk.EventControllerScrollFlags.HORIZONTAL |
+                                         Gtk.EventControllerScrollFlags.DISCRETE)
+    ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+    def on_scroll(_ctrl, dx, dy):
+        if scrolled_window:
+            _scroll_adjustment(scrolled_window.get_hadjustment(), dx)
+            _scroll_adjustment(scrolled_window.get_vadjustment(), dy)
+        return True
+
+    ctrl.connect("scroll", on_scroll)
+    widget.add_controller(ctrl)
+    return widget
 
 def rgb_hex_to_tuple(rgb_hex: str):
     h = rgb_hex.lstrip("#")
@@ -414,6 +458,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         # Body
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_hexpand(True); scrolled.set_vexpand(True)
+        self.scrolled = scrolled
         self.set_child(scrolled)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
@@ -475,6 +520,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.profile_combo = Gtk.DropDown.new_from_strings([])
         self.profile_combo.set_hexpand(True)
+        redirect_scroll_to_page(self.profile_combo, self.scrolled)
         self.profile_combo.connect("notify::selected",
                                    lambda *_: self._on_profile_selected())
         row.append(self.profile_combo)
@@ -505,6 +551,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         topline.append(Gtk.Label(label="Active:"))
         self.dpi_active_combo = Gtk.DropDown.new_from_strings(
             [f"Stage {i}" for i in range(NSTAGES)])
+        redirect_scroll_to_page(self.dpi_active_combo, self.scrolled)
         self.dpi_active_combo.connect("notify::selected",
             lambda *_: (self._sync_field("dpi_active",
                                          self.dpi_active_combo.get_selected()),
@@ -513,6 +560,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         topline.append(Gtk.Label(label="Enabled count:"))
         self.dpi_count_spin = Gtk.SpinButton.new_with_range(1, NSTAGES, 1)
+        redirect_scroll_to_page(self.dpi_count_spin, self.scrolled)
         self.dpi_count_spin.connect("value-changed",
             lambda w: (self._sync_field("dpi_count", int(w.get_value())),
                        self._update_stage_sensitivity(),
@@ -535,12 +583,14 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         label.set_xalign(0); label.set_size_request(80, -1)
         b.append(label)
 
-        spin = Gtk.SpinButton.new_with_range(100, 26000, 100)
+        spin = Gtk.SpinButton.new_with_range(DPI_MIN_CPI, DPI_MAX_CPI, 100)
+        redirect_scroll_to_page(spin, self.scrolled)
         spin.set_size_request(120, -1)
         b.append(spin)
 
         slider = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
-                                          100, 26000, 100)
+                                          DPI_MIN_CPI, DPI_MAX_CPI, 100)
+        redirect_scroll_to_page(slider, self.scrolled)
         slider.set_hexpand(True)
         slider.set_draw_value(False)
         b.append(slider)
@@ -576,6 +626,8 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         r_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
         g_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
         b_spin = Gtk.SpinButton.new_with_range(0, 255, 1)
+        for rgb_spin in (r_spin, g_spin, b_spin):
+            redirect_scroll_to_page(rgb_spin, self.scrolled)
 
         preview = Gtk.DrawingArea()
         preview.set_content_width(36)
@@ -889,6 +941,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         type_combo = Gtk.DropDown.new_from_strings(
             [t[1] for t in ACTION_TYPES])
+        redirect_scroll_to_page(type_combo, self.scrolled)
         b.append(type_combo)
 
         # Stack of param widgets — one row per type, swapped via reveal
@@ -898,6 +951,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         # mouse: single dropdown
         m_combo = Gtk.DropDown.new_from_strings([m[1] for m in MOUSE_BUTTONS])
+        redirect_scroll_to_page(m_combo, self.scrolled)
         m_combo.connect("notify::selected",
             lambda *_: self._set_button(i, "mouse",
                                         MOUSE_BUTTONS[m_combo.get_selected()][0], 0))
@@ -905,6 +959,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         # dpi:
         d_combo = Gtk.DropDown.new_from_strings([d[1] for d in DPI_ACTIONS])
+        redirect_scroll_to_page(d_combo, self.scrolled)
         d_combo.connect("notify::selected",
             lambda *_: self._set_button(i, "dpi",
                                         DPI_ACTIONS[d_combo.get_selected()][0], 0))
@@ -918,6 +973,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         # key: usage + modifier checkboxes
         krow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         k_combo = Gtk.DropDown.new_from_strings([k[1] for k in HID_KEYS])
+        redirect_scroll_to_page(k_combo, self.scrolled)
         krow.append(k_combo)
         mod_chks = []
         for v, mn in KBD_MODS[:4]:    # show only Left modifiers in the row
@@ -932,6 +988,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         # consumer:
         c_combo = Gtk.DropDown.new_from_strings([c[1] for c in CONSUMER_KEYS])
+        redirect_scroll_to_page(c_combo, self.scrolled)
         def on_consumer(*_):
             usage = CONSUMER_KEYS[c_combo.get_selected()][0]
             self._set_button(i, "consumer", usage & 0xff, (usage >> 8) & 0xff)
@@ -973,6 +1030,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         polling_row.append(Gtk.Label(label="Polling rate:"))
         self.polling_combo = Gtk.DropDown.new_from_strings(
             [f"{r} Hz" for r in POLLING_RATES])
+        redirect_scroll_to_page(self.polling_combo, self.scrolled)
         self.polling_combo.connect("notify::selected",
             lambda *_: (self._sync_field("polling",
                                          POLLING_RATES[self.polling_combo.get_selected()]),
@@ -984,6 +1042,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         light_row.append(Gtk.Label(label="Light effect:"))
         self.light_combo = Gtk.DropDown.new_from_strings(
             [label for _, label in LIGHT_MODES])
+        redirect_scroll_to_page(self.light_combo, self.scrolled)
         self.light_combo.set_tooltip_text(
             "Switch the 0x06/0x05 DPI light mode. Labels follow the XML names; "
             "ACK/readback does not guarantee visible LED behavior.")
@@ -998,6 +1057,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         sleep_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         sleep_row.append(Gtk.Label(label="Sleep timeout (s):"))
         self.sleep_spin = Gtk.SpinButton.new_with_range(0, 65535, 30)
+        redirect_scroll_to_page(self.sleep_spin, self.scrolled)
         self.sleep_spin.connect("value-changed",
             lambda w: (self._sync_field("sleep_seconds", int(w.get_value())),
                        self._debounce(self._write_sleep) if not self._guard else None))
@@ -1098,6 +1158,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         return False
 
     def sync_ui_from_profile(self):
+        sanitize_profile_ranges(self.profile)
         self._enter_guard("sync_ui_from_profile")
         debug("sync UI from profile: " + profile_summary(self.profile))
         try:
@@ -1172,6 +1233,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         if idx < 0 or idx >= len(files): return
         try:
             self.profile = Profile.load(files[idx])
+            sanitize_profile_ranges(self.profile)
         except Exception as e:
             self.notify(f"Load failed: {e}", err=True); return
         self.sync_ui_from_profile()
@@ -1241,6 +1303,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         try:
             out = run_cli(self.cli, "read")
             loaded = Profile.from_device_text(out)
+            sanitize_profile_ranges(loaded)
             debug("refresh_device: parsed complete device profile: " + profile_summary(loaded))
             self.profile = loaded
             self.sync_ui_from_profile()
