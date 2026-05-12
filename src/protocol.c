@@ -13,6 +13,8 @@
  *   将配置1切换到配置2、3、4.pcapng — profile-switch readback
  *   连接+切换DPI.pcapng — handshake replies, battery (0xc0), DPI
  *                         button notification (0xc2), readback format
+ *   插入接收器+识别.pcapng — 2.4G receiver insertion: 0x10 identity
+ *                         replies before the later 0xc0 online event
  *
  * Frame: 32 bytes, sent as HID Output Report on EP 0x05, mirrored as
  * HID Input Report on EP 0x84.
@@ -268,20 +270,6 @@ static int query(struct sc360se_device *dev, uint8_t op, uint8_t *reply)
     return sc360se_xfer(dev, out, reply);
 }
 
-static int query_with_retries(struct sc360se_device *dev, uint8_t op, uint8_t *reply)
-{
-    int rc = 0;
-    for (int i = 0; i < 3; i++) {
-        rc = query(dev, op, reply);
-        if (rc < 0) return rc;
-        if (reply[1] != 0x02) return 0;
-        if (debug_enabled())
-            fprintf(stderr, "[sc360se] query 0x%02x returned error reply; retry %d/3\n",
-                    op, i + 1);
-    }
-    return 0;
-}
-
 static int64_t monotonic_ms(void)
 {
     struct timespec ts;
@@ -517,38 +505,99 @@ static int resend_missing_query(struct sc360se_device *dev,
     return 0;
 }
 
+static int info_reply_mouse_ready(const uint8_t *in)
+{
+    return in[14] != 0x00;
+}
+
+static int ready_probe_frame(struct sc360se_device *dev,
+                             const uint8_t *in,
+                             int *saw_not_ready)
+{
+    if (in[0] == 0x10 && in[3] == 0x0b) {
+        memcpy(dev->dev_id, &in[4], 4);
+        dev->dev_id[4] = 0;
+        if (info_reply_mouse_ready(in)) return 1;
+
+        *saw_not_ready = 1;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] receiver identified as %.4s, but mouse is "
+                    "not online yet (0x10 byte[14]=00)\n",
+                    dev->dev_id);
+        return 0;
+    }
+
+    if (in[0] == SC360SE_EVT_BATTERY) {
+        if (in[1] != 0x00) {
+            if (debug_enabled())
+                fprintf(stderr,
+                        "[sc360se] link online notification: battery=%u%%\n",
+                        in[2]);
+            return 1;
+        }
+
+        *saw_not_ready = 1;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] link offline notification: battery=%u%%\n",
+                    in[2]);
+        return 0;
+    }
+
+    return -1;
+}
+
+static int collect_ready_probe(struct sc360se_device *dev,
+                               uint8_t *in,
+                               int timeout_ms,
+                               int *saw_not_ready)
+{
+    int64_t deadline = monotonic_ms() + timeout_ms;
+    while (monotonic_ms() < deadline) {
+        int left = (int)(deadline - monotonic_ms());
+        if (left <= 0) break;
+        if (left > 80) left = 80;
+
+        int rc = sc360se_recv(dev, in, left);
+        if (rc == -ETIMEDOUT) continue;
+        if (rc < 0) return rc;
+        if (ready_probe_frame(dev, in, saw_not_ready) > 0) return 0;
+    }
+    return -ETIMEDOUT;
+}
+
 static int read_ready_info(struct sc360se_device *dev, uint8_t *in)
 {
     int saw_not_ready = 0;
+    int long_online_wait_used = 0;
 
-    for (int attempt = 0; attempt < 6; attempt++) {
-        int rc = query_with_retries(dev, 0x10, in);
-        if (rc == -ETIMEDOUT) {
-            sleep_ms(120);
-            continue;
-        }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int rc = send_bare_query(dev, 0x10);
         if (rc < 0) return rc;
 
-        if (in[0] != 0x10 || in[3] != 0x0b) {
-            if (debug_enabled())
-                fprintf(stderr,
-                        "[sc360se] unexpected 0x10 probe reply op=0x%02x sub=0x%02x\n",
-                        in[0], in[3]);
+        rc = collect_ready_probe(dev, in, attempt == 0 ? 450 : 260,
+                                 &saw_not_ready);
+        if (rc == 0) return 0;
+        if (rc < 0 && rc != -ETIMEDOUT) return rc;
+
+        if (dev->link == SC360SE_LINK_24G) {
+            /* 插入接收器+识别.pcapng shows the Windows driver can receive
+             * S057 0x10 identity replies with byte[14]=00 first, then the
+             * real "mouse online" state arrives later as c0 01 battery. */
+            int wait_ms;
+            if (saw_not_ready && !long_online_wait_used) {
+                wait_ms = 1900;
+                long_online_wait_used = 1;
+            } else {
+                wait_ms = attempt == 0 ? 1500 : 350;
+            }
+            rc = collect_ready_probe(dev, in, wait_ms, &saw_not_ready);
+            if (rc == 0) return 0;
+            if (rc < 0 && rc != -ETIMEDOUT) return rc;
+        } else {
             sleep_ms(120);
-            continue;
         }
-
-        memcpy(dev->dev_id, &in[4], 4);
-        dev->dev_id[4] = 0;
-        if (in[14] != 0x00) return 0;
-
-        saw_not_ready = 1;
-        if (debug_enabled())
-            fprintf(stderr,
-                    "[sc360se] dongle reports mouse not ready/asleep "
-                    "(0x10 reply byte[14]=00); probe %d/6\n",
-                    attempt + 1);
-        sleep_ms(160);
     }
 
     return saw_not_ready ? -EHOSTDOWN : -EIO;
@@ -572,11 +621,10 @@ int sc360se_read_config(struct sc360se_device *dev,
 
     sc360se_profile_default(out);
 
-    drain_pending(dev);
-
     /* The 2.4G dongle can answer 0x10 from its local state even when the
-     * mouse is asleep. In that state config queries return no useful data;
-     * fail early instead of showing the default profile as if it were real. */
+     * mouse is asleep or still coming online after receiver insertion. In
+     * that state config queries return no useful data; fail early instead
+     * of showing the default profile as if it were real. */
     rc = read_ready_info(dev, in);
     if (rc == -EHOSTDOWN) {
         if (debug_enabled())
@@ -585,6 +633,8 @@ int sc360se_read_config(struct sc360se_device *dev,
                     "(0x10 reply byte[14]=00); wake/move/click the mouse\n");
     }
     if (rc < 0) return rc;
+
+    drain_pending(dev);
 
     static const uint8_t seq[] = {0x10, 0x11, 0x12, 0x13,
                                   0x14, 0x15, 0x16, 0x17, 0x20};
@@ -672,6 +722,8 @@ int sc360se_read_battery(struct sc360se_device *dev)
     int rc = query(dev, 0x10, in);
     if (rc < 0) return rc;
     if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
+    if (dev->link == SC360SE_LINK_24G && !info_reply_mouse_ready(in))
+        return -EHOSTDOWN;
     return (int)in[13];
 }
 
@@ -719,6 +771,8 @@ int sc360se_read_status(struct sc360se_device *dev,
         rc = query(dev, 0x10, in);
         if (rc < 0) return rc;
         if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
+        if (dev->link == SC360SE_LINK_24G && !info_reply_mouse_ready(in))
+            return -EHOSTDOWN;
         *battery_pct = (int)in[13];
     }
 
