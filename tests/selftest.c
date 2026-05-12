@@ -207,10 +207,20 @@ int main(void)
     memset(f, 0, sizeof(f));
     f[0] = 0xc0; f[1] = 0x01; f[2] = 0x5c;
     if (sc360se_decode_event(f, &evt) == 0 &&
-        evt.type == SC360SE_EVT_BATTERY && evt.battery_pct == 92)
+        evt.type == SC360SE_EVT_BATTERY &&
+        evt.link_online == 1 && evt.battery_pct == 92)
         { printf("PASS: decode battery 92%%\n"); pass++; }
     else
         { printf("FAIL: decode battery 92%%\n"); fail++; }
+
+    memset(f, 0, sizeof(f));
+    f[0] = 0xc0; f[1] = 0x00; f[2] = 0x5a;
+    if (sc360se_decode_event(f, &evt) == 0 &&
+        evt.type == SC360SE_EVT_BATTERY &&
+        evt.link_online == 0 && evt.battery_pct == 90)
+        { printf("PASS: decode link disconnected\n"); pass++; }
+    else
+        { printf("FAIL: decode link disconnected\n"); fail++; }
 
     /* DPI button: 0xc2 26 18... → stage 2/6, 2400 cpi */
     memset(f, 0, sizeof(f));

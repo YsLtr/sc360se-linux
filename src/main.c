@@ -280,10 +280,13 @@ static int do_read(struct sc360se_device *dev)
 
 static int do_watch(struct sc360se_device *dev)
 {
-    /* Drain the handshake replies first so we don't print them as events. */
-    sc360se_handshake(dev);
-
     uint8_t f[SC360SE_FRAME_LEN];
+    for (int i = 0; i < 16; i++) {
+        int r = sc360se_try_recv(dev, f);
+        if (r == -ETIMEDOUT) break;
+        if (r < 0) return r;
+    }
+
     struct sc360se_event evt;
     for (;;) {
         int r = sc360se_recv(dev, f, 60000);
@@ -292,6 +295,7 @@ static int do_watch(struct sc360se_device *dev)
         if (sc360se_decode_event(f, &evt) < 0) continue;
         switch (evt.type) {
         case SC360SE_EVT_BATTERY:
+            printf("link: %s\n", evt.link_online ? "connected" : "disconnected");
             printf("battery: %u%%\n", evt.battery_pct);
             break;
         case SC360SE_EVT_DPI:

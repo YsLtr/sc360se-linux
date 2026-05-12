@@ -954,6 +954,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
     def refresh_device(self):
         debug("refresh_device: begin")
+        self._stop_watch()
         self._write_enabled = False
         debug("device writes disabled during refresh")
         if self._enable_writes_src:
@@ -997,6 +998,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                 GLib.source_remove(self._enable_writes_src)
                 self._enable_writes_src = None
             debug("device writes remain disabled because refresh failed")
+            self._start_watch()
         return False
 
     def _start_watch(self):
@@ -1065,6 +1067,17 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         elif line.startswith("battery: "):
             pct = line.split(": ", 1)[1].rstrip("%")
             self.battery_label.set_text(f"Battery: {pct}")
+        elif line == "link: disconnected":
+            self._write_enabled = False
+            self.dot.remove_css_class("success")
+            self.dot.add_css_class("error")
+            self.status_label.set_text("Mouse disconnected or asleep")
+        elif line == "link: connected":
+            self.dot.remove_css_class("error")
+            self.dot.add_css_class("muted")
+            if not self._write_enabled:
+                debug("watch: link connected; scheduling refresh")
+                GLib.timeout_add(250, self.refresh_device)
         return True
 
     def _stop_watch(self):

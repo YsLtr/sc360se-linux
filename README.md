@@ -120,7 +120,7 @@ sc360se watch                              # decoded battery & DPI events
 | 0x13 | — | DPI readback | query: bare op; reply sub=0x19, [4..28]=config |
 | 0x14 | — | color readback | query: bare op; reply sub=0x12, [4..27]=6×RGBF |
 | 0x17 | — | sleep readback | query: bare op; reply sub=0x05, [4..5]=seconds |
-| 0xc0 | — | battery notify | **unsolicited IN**; [2]=battery% 0-100 |
+| 0xc0 | — | link/battery notify | **unsolicited IN**; [1]=online flag, [2]=battery% 0-100 |
 | 0xc2 | — | DPI notify | **unsolicited IN**; [1]=(active<<4)\|count, [2..3]=cpi/100 LE |
 
 All readback queries (0x11-0x17, 0x20) use a bare opcode frame:

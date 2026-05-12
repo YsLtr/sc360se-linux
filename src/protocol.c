@@ -270,6 +270,16 @@ static int64_t monotonic_ms(void)
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static void sleep_ms(int ms)
+{
+    if (ms <= 0) return;
+    struct timespec ts = {
+        .tv_sec = ms / 1000,
+        .tv_nsec = (long)(ms % 1000) * 1000000L,
+    };
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
+}
+
 static void drain_pending(struct sc360se_device *dev)
 {
     uint8_t stale[SC360SE_FRAME_LEN];
@@ -301,16 +311,70 @@ enum {
 static const unsigned READ_NEED = GOT_BUTTONS | GOT_POLLING | GOT_DPI |
                                   GOT_COLORS  | GOT_SLEEP;
 
-static void parse_config_reply(struct sc360se_device *dev,
-                               struct sc360se_profile *out,
-                               const uint8_t *in,
-                               unsigned *got)
+static const char *read_flag_name(unsigned flag)
+{
+    switch (flag) {
+    case GOT_BUTTONS: return "buttons";
+    case GOT_POLLING: return "polling";
+    case GOT_DPI:     return "dpi";
+    case GOT_COLORS:  return "colors";
+    case GOT_SLEEP:   return "sleep";
+    default:          return "?";
+    }
+}
+
+static int plausible_reply_header(const uint8_t *p)
+{
+    if (p[1] != 0x00 || p[2] != 0x01) return 0;
+    switch (p[0]) {
+    case 0x10: return p[3] == 0x0b;
+    case 0x11: return p[3] == 0x12;
+    case 0x12: return p[3] == 0x01;
+    case 0x13: return p[3] == 0x19;
+    case 0x14: return p[3] == 0x12;
+    case 0x15: return p[3] == 0x02;
+    case 0x16: return p[3] == 0x05;
+    case 0x17: return p[3] == 0x05;
+    case 0x20: return p[3] == 0x02;
+    default:   return 0;
+    }
+}
+
+static void debug_misaligned_reply(const uint8_t *in)
+{
+    if (!debug_enabled()) return;
+    for (int i = 1; i <= SC360SE_FRAME_LEN - 4; i++) {
+        if (plausible_reply_header(in + i)) {
+            fprintf(stderr,
+                    "[sc360se] ignoring partial/misaligned reply window; "
+                    "found op=0x%02x header at byte %d\n",
+                    in[i], i);
+            return;
+        }
+    }
+}
+
+static int ack_only_reply(const uint8_t *in)
+{
+    return in[1] == 0x01 && in[2] == 0x00 && in[3] == 0x00;
+}
+
+static unsigned parse_config_reply(struct sc360se_device *dev,
+                                   struct sc360se_profile *out,
+                                   const uint8_t *in,
+                                   unsigned *got)
 {
     if (in[1] == 0x02) {
         if (debug_enabled())
             fprintf(stderr, "[sc360se] query 0x%02x failed with device error reply\n",
                     in[0]);
-        return;
+        return 0;
+    }
+
+    if (ack_only_reply(in)) {
+        if (debug_enabled())
+            fprintf(stderr, "[sc360se] ignoring ack-only frame op=0x%02x\n", in[0]);
+        return 0;
     }
 
     switch (in[0]) {
@@ -319,7 +383,7 @@ static void parse_config_reply(struct sc360se_device *dev,
             memcpy(dev->dev_id, &in[4], 4);
             dev->dev_id[4] = 0;
         }
-        break;
+        return 0;
     case 0x11:
         if (in[3] == 0x12) {
             for (int j = 0; j < SC360SE_NBUTTONS; j++) {
@@ -329,12 +393,14 @@ static void parse_config_reply(struct sc360se_device *dev,
                 out->buttons[j].p2 = in[4 + j*3 + 2];
             }
             *got |= GOT_BUTTONS;
+            return GOT_BUTTONS;
         }
         break;
     case 0x12:
         if (in[3] == 0x01) {
             out->polling = (enum sc360se_polling_rate)in[4];
             *got |= GOT_POLLING;
+            return GOT_POLLING;
         }
         break;
     case 0x13:
@@ -350,6 +416,7 @@ static void parse_config_reply(struct sc360se_device *dev,
                 out->dpi.stage[j].y_cpi = y * 100;
             }
             *got |= GOT_DPI;
+            return GOT_DPI;
         }
         break;
     case 0x14:
@@ -361,21 +428,26 @@ static void parse_config_reply(struct sc360se_device *dev,
                 out->dpi.stage[j].flag = in[22 + j];
             }
             *got |= GOT_COLORS;
+            return GOT_COLORS;
         }
         break;
     case 0x17:
         if (in[3] == 0x05) {
             out->sleep_seconds = (uint16_t)(in[4] | (in[5] << 8));
             *got |= GOT_SLEEP;
+            return GOT_SLEEP;
         }
         break;
     }
+    debug_misaligned_reply(in);
+    return 0;
 }
 
 static int collect_replies(struct sc360se_device *dev,
                            struct sc360se_profile *out,
                            unsigned *got,
-                           int timeout_ms)
+                           int timeout_ms,
+                           int *ack_only_count)
 {
     uint8_t in[SC360SE_FRAME_LEN];
     int64_t deadline = monotonic_ms() + timeout_ms;
@@ -386,7 +458,11 @@ static int collect_replies(struct sc360se_device *dev,
         int rc = sc360se_recv(dev, in, left);
         if (rc == -ETIMEDOUT) continue;
         if (rc < 0) return rc;
-        parse_config_reply(dev, out, in, got);
+        if (ack_only_reply(in) && ack_only_count) (*ack_only_count)++;
+        unsigned parsed = parse_config_reply(dev, out, in, got);
+        if (parsed && debug_enabled())
+            fprintf(stderr, "[sc360se] parsed config reply: %s\n",
+                    read_flag_name(parsed));
     }
     return 0;
 }
@@ -395,14 +471,59 @@ static int resend_missing_query(struct sc360se_device *dev,
                                 struct sc360se_profile *out,
                                 unsigned *got,
                                 unsigned flag,
-                                uint8_t op)
+                                uint8_t op,
+                                int *ack_only_count)
 {
     if (*got & flag) return 0;
-    if (debug_enabled())
-        fprintf(stderr, "[sc360se] retry missing config query 0x%02x\n", op);
-    int rc = send_bare_query(dev, op);
-    if (rc < 0) return rc;
-    return collect_replies(dev, out, got, 220);
+    for (int attempt = 0; attempt < 2 && !(*got & flag); attempt++) {
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] retry missing config query 0x%02x (%s) %d/2\n",
+                    op, read_flag_name(flag), attempt + 1);
+        int rc = send_bare_query(dev, op);
+        if (rc < 0) return rc;
+        rc = collect_replies(dev, out, got, 220, ack_only_count);
+        if (rc < 0) return rc;
+        if (!(*got & flag)) sleep_ms(35);
+    }
+    return 0;
+}
+
+static int read_ready_info(struct sc360se_device *dev, uint8_t *in)
+{
+    int saw_not_ready = 0;
+
+    for (int attempt = 0; attempt < 6; attempt++) {
+        int rc = query_with_retries(dev, 0x10, in);
+        if (rc == -ETIMEDOUT) {
+            sleep_ms(120);
+            continue;
+        }
+        if (rc < 0) return rc;
+
+        if (in[0] != 0x10 || in[3] != 0x0b) {
+            if (debug_enabled())
+                fprintf(stderr,
+                        "[sc360se] unexpected 0x10 probe reply op=0x%02x sub=0x%02x\n",
+                        in[0], in[3]);
+            sleep_ms(120);
+            continue;
+        }
+
+        memcpy(dev->dev_id, &in[4], 4);
+        dev->dev_id[4] = 0;
+        if (in[14] != 0x00) return 0;
+
+        saw_not_ready = 1;
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] dongle reports mouse not ready/asleep "
+                    "(0x10 reply byte[14]=00); probe %d/6\n",
+                    attempt + 1);
+        sleep_ms(160);
+    }
+
+    return saw_not_ready ? -EHOSTDOWN : -EIO;
 }
 
 /* ------------------------------------------------------------------ */
@@ -419,6 +540,7 @@ int sc360se_read_config(struct sc360se_device *dev,
     uint8_t in[SC360SE_FRAME_LEN];
     int rc;
     unsigned got = 0;
+    int ack_only_count = 0;
 
     sc360se_profile_default(out);
 
@@ -427,18 +549,14 @@ int sc360se_read_config(struct sc360se_device *dev,
     /* The 2.4G dongle can answer 0x10 from its local state even when the
      * mouse is asleep. In that state config queries return no useful data;
      * fail early instead of showing the default profile as if it were real. */
-    rc = query_with_retries(dev, 0x10, in);
-    if (rc < 0) return rc;
-    if (in[0] != 0x10 || in[3] != 0x0b) return -EIO;
-    memcpy(dev->dev_id, &in[4], 4);
-    dev->dev_id[4] = 0;
-    if (in[14] == 0x00) {
+    rc = read_ready_info(dev, in);
+    if (rc == -EHOSTDOWN) {
         if (debug_enabled())
             fprintf(stderr,
                     "[sc360se] dongle reports mouse not ready/asleep "
                     "(0x10 reply byte[14]=00); wake/move/click the mouse\n");
-        return -EHOSTDOWN;
     }
+    if (rc < 0) return rc;
 
     static const uint8_t seq[] = {0x10, 0x11, 0x12, 0x13,
                                   0x14, 0x15, 0x16, 0x17, 0x20};
@@ -446,7 +564,7 @@ int sc360se_read_config(struct sc360se_device *dev,
         rc = send_bare_query(dev, seq[i]);
         if (rc < 0) return rc;
 
-        int64_t step_deadline = monotonic_ms() + 180;
+        int64_t step_deadline = monotonic_ms() + 260;
         for (;;) {
             int left = (int)(step_deadline - monotonic_ms());
             if (left <= 0) break;
@@ -455,23 +573,45 @@ int sc360se_read_config(struct sc360se_device *dev,
             rc = sc360se_recv(dev, in, left);
             if (rc == -ETIMEDOUT) break;
             if (rc < 0) return rc;
-            parse_config_reply(dev, out, in, &got);
+            if (ack_only_reply(in)) ack_only_count++;
+            unsigned parsed = parse_config_reply(dev, out, in, &got);
+            if (parsed && debug_enabled())
+                fprintf(stderr, "[sc360se] parsed config reply: %s\n",
+                        read_flag_name(parsed));
             if ((got & READ_NEED) == READ_NEED) return 0;
         }
     }
 
-    rc = collect_replies(dev, out, &got, 500);
+    rc = collect_replies(dev, out, &got, 700, &ack_only_count);
     if (rc < 0) return rc;
 
+    if (got == 0 && ack_only_count >= 2) {
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] config queries returned only ack frames; "
+                    "treating mouse as not ready for readback\n");
+        return -EHOSTDOWN;
+    }
+
     for (int attempt = 0; attempt < 2 && (got & READ_NEED) != READ_NEED; attempt++) {
-        if ((rc = resend_missing_query(dev, out, &got, GOT_BUTTONS, 0x11)) < 0) return rc;
-        if ((rc = resend_missing_query(dev, out, &got, GOT_POLLING, 0x12)) < 0) return rc;
-        if ((rc = resend_missing_query(dev, out, &got, GOT_DPI,     0x13)) < 0) return rc;
-        if ((rc = resend_missing_query(dev, out, &got, GOT_COLORS,  0x14)) < 0) return rc;
-        if ((rc = resend_missing_query(dev, out, &got, GOT_SLEEP,   0x17)) < 0) return rc;
+        unsigned before = got;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_BUTTONS, 0x11, &ack_only_count)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_POLLING, 0x12, &ack_only_count)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_DPI,     0x13, &ack_only_count)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_COLORS,  0x14, &ack_only_count)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_SLEEP,   0x17, &ack_only_count)) < 0) return rc;
+        if (got == before) break;
+        if ((got & READ_NEED) != READ_NEED) sleep_ms(60);
     }
 
     if ((got & READ_NEED) == READ_NEED) return 0;
+    if (got == 0 && ack_only_count >= 2) {
+        if (debug_enabled())
+            fprintf(stderr,
+                    "[sc360se] config retries returned only ack frames; "
+                    "treating mouse as not ready for readback\n");
+        return -EHOSTDOWN;
+    }
 
     const unsigned need = READ_NEED;
     if ((got & need) != need) {
@@ -508,7 +648,7 @@ int sc360se_read_battery(struct sc360se_device *dev)
 /* ------------------------------------------------------------------ */
 /* Decode an unsolicited notification frame                           */
 /*                                                                    */
-/*   0xc0 — battery: byte[2] = percentage 0-100                       */
+/*   0xc0 — link/battery: byte[1] = online flag, byte[2] = percent    */
 /*   0xc2 — DPI change: byte[1] = (active<<4)|count,                  */
 /*           byte[2..3] = cpi/100 LE u16                              */
 /* ------------------------------------------------------------------ */
@@ -519,6 +659,7 @@ int sc360se_decode_event(const uint8_t *frame, struct sc360se_event *evt)
     switch (frame[0]) {
     case SC360SE_EVT_BATTERY:
         evt->type = SC360SE_EVT_BATTERY;
+        evt->link_online = frame[1] ? 1 : 0;
         evt->battery_pct = frame[2];
         return 0;
     case SC360SE_EVT_DPI:

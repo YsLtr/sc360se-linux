@@ -115,6 +115,7 @@ int sc360se_handshake(struct sc360se_device *dev);
 
 struct sc360se_event {
     uint8_t  type;          /* SC360SE_EVT_BATTERY or SC360SE_EVT_DPI */
+    uint8_t  link_online;   /* valid when type == BATTERY: 0=offline, 1=online */
     uint8_t  battery_pct;   /* 0-100, valid when type == BATTERY */
     uint8_t  dpi_active;    /* valid when type == DPI */
     uint8_t  dpi_count;     /* valid when type == DPI */
