@@ -89,15 +89,6 @@ NBUTTONS = 6
 DPI_MIN_CPI = 100
 DPI_MAX_CPI = 10000
 
-LIGHT_MODES = [
-    (1, "1 Flow"),
-    (2, "2 Breathing"),
-    (3, "3 Static"),
-    (4, "4 Neon"),
-    (5, "5 Wave"),
-    (6, "6 Off"),
-]
-
 BUTTON_LABELS = [
     "Left",
     "Right",
@@ -176,10 +167,10 @@ class Button:
 @dataclass
 class Profile:
     polling: int = 1000
-    light_mode: int = 2
-    sleep_seconds: int = 90
+    sleep_seconds: int = 900
+    move_wakeup: bool = True
     dpi_active: int = 0
-    dpi_count: int = 5
+    dpi_count: int = 6
     stages: list = field(default_factory=lambda: [Stage() for _ in range(NSTAGES)])
     buttons: list = field(default_factory=lambda: [
         Button("mouse", 0x01, 0), Button("mouse", 0x02, 0),
@@ -190,10 +181,14 @@ class Profile:
     @classmethod
     def default(cls):
         p = cls()
-        defaults = [800, 1600, 2400, 3200, 5200, 6000]
+        defaults = [800, 1600, 2400, 3200, 6500, 10000]
+        colors = ["#FF0000", "#00FF00", "#0000FF",
+                  "#FF00FF", "#FFFF00", "#00FFFF"]
         for i, c in enumerate(defaults):
             p.stages[i].x_cpi = c
             p.stages[i].y_cpi = c
+            p.stages[i].rgb = colors[i]
+            p.stages[i].flag = 0x00
         return p
 
     @classmethod
@@ -217,12 +212,10 @@ class Profile:
 
             if k == "polling":
                 p.polling = int(v)
-            elif k == "light.mode":
-                mode = int(v.split()[0], 0)
-                if 1 <= mode <= 6:
-                    p.light_mode = mode
             elif k == "sleep":
                 p.sleep_seconds = int(v)
+            elif k == "move.wakeup":
+                p.move_wakeup = bool(int(v.split()[0], 0))
             elif k == "dpi.active":
                 p.dpi_active = int(v)
             elif k == "dpi.count":
@@ -269,9 +262,9 @@ class Profile:
             elif k == "sleep":
                 p.sleep_seconds = int(v.rstrip("s").strip())
                 seen.add("sleep")
-            elif k == "light.mode":
-                p.light_mode = int(v.split()[0], 0)
-                seen.add("light.mode")
+            elif k == "move.wakeup":
+                p.move_wakeup = bool(int(v.split()[0], 0))
+                seen.add("move.wakeup")
             elif k == "dpi.active":
                 p.dpi_active = int(v)
                 seen.add("dpi.active")
@@ -303,7 +296,7 @@ class Profile:
                 button_seen.add(idx)
 
         missing = []
-        for name in ("polling", "sleep", "dpi.active", "dpi.count"):
+        for name in ("polling", "sleep", "move.wakeup", "dpi.active", "dpi.count"):
             if name not in seen:
                 missing.append(name)
         missing.extend(f"dpi[{i}]" for i in range(NSTAGES) if i not in stage_seen)
@@ -315,8 +308,8 @@ class Profile:
     def save(self, path: Path):
         lines = ["# AULA SC360SE profile",
                  f"polling = {self.polling}",
-                 f"light.mode = {self.light_mode}",
                  f"sleep   = {self.sleep_seconds}",
+                 f"move.wakeup = {1 if self.move_wakeup else 0}",
                  f"dpi.active = {self.dpi_active}",
                  f"dpi.count  = {self.dpi_count}"]
         for i, s in enumerate(self.stages):
@@ -343,7 +336,9 @@ def snap_dpi(value: int) -> int:
 def sanitize_profile_ranges(profile: Profile):
     profile.dpi_active = max(0, min(NSTAGES - 1, profile.dpi_active))
     profile.dpi_count = max(1, min(NSTAGES, profile.dpi_count))
-    profile.sleep_seconds = max(0, min(65535, profile.sleep_seconds))
+    profile.sleep_seconds = max(0, min(2550, profile.sleep_seconds))
+    profile.sleep_seconds = (profile.sleep_seconds // 10) * 10
+    profile.move_wakeup = bool(profile.move_wakeup)
     for stage in profile.stages:
         stage.x_cpi = snap_dpi(stage.x_cpi)
         stage.y_cpi = snap_dpi(stage.y_cpi)
@@ -399,7 +394,7 @@ def profile_summary(p: Profile) -> str:
     buttons = ", ".join(f"{i}:{b.type}/{b.p1:02x}/{b.p2:02x}"
                         for i, b in enumerate(p.buttons))
     return (f"polling={p.polling} sleep={p.sleep_seconds} "
-            f"light={p.light_mode} "
+            f"move_wakeup={1 if p.move_wakeup else 0} "
             f"active={p.dpi_active} count={p.dpi_count} "
             f"dpi=[{dpi}] buttons=[{buttons}]")
 
@@ -895,23 +890,11 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         sync_color_widgets()
         b.append(rgb_box)
 
-        led_chk = Gtk.CheckButton(label="LED")
-        led_chk.set_tooltip_text(
-            "Store this stage's DPI color flag. The light-mode command is "
-            "sent separately for LED experiments.")
-        def on_led(_w):
-            if not self._guard:
-                self.profile.stages[i].flag = 0xff if led_chk.get_active() else 0x00
-                debug(f"stage {i} LED flag changed: {self.profile.stages[i].flag:02x}")
-                self._write_colors()
-        led_chk.connect("toggled", on_led)
-        b.append(led_chk)
-
         return {"box": b, "spin": spin, "slider": slider,
                 "r": r_spin, "g": g_spin, "b": b_spin,
                 "preview": preview, "color": color_button,
                 "sync_color": sync_color_widgets,
-                "led": led_chk, "label": label}
+                "label": label}
 
     def _build_buttons_section(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1038,31 +1021,24 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         polling_row.append(self.polling_combo)
         box.append(polling_row)
 
-        light_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        light_row.append(Gtk.Label(label="Light effect:"))
-        self.light_combo = Gtk.DropDown.new_from_strings(
-            [label for _, label in LIGHT_MODES])
-        redirect_scroll_to_page(self.light_combo, self.scrolled)
-        self.light_combo.set_tooltip_text(
-            "Switch the 0x06/0x05 DPI light mode. Labels follow the XML names; "
-            "ACK/readback does not guarantee visible LED behavior.")
-        self.light_combo.connect("notify::selected",
-            lambda *_: (self._sync_field(
-                            "light_mode",
-                            LIGHT_MODES[self.light_combo.get_selected()][0]),
-                        self._write_light_mode() if not self._guard else None))
-        light_row.append(self.light_combo)
-        box.append(light_row)
-
         sleep_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         sleep_row.append(Gtk.Label(label="Sleep timeout (s):"))
-        self.sleep_spin = Gtk.SpinButton.new_with_range(0, 65535, 30)
+        self.sleep_spin = Gtk.SpinButton.new_with_range(0, 2550, 10)
         redirect_scroll_to_page(self.sleep_spin, self.scrolled)
         self.sleep_spin.connect("value-changed",
             lambda w: (self._sync_field("sleep_seconds", int(w.get_value())),
                        self._debounce(self._write_sleep) if not self._guard else None))
         sleep_row.append(self.sleep_spin)
         box.append(sleep_row)
+
+        wake_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        wake_row.append(Gtk.Label(label="Move wakeup:"))
+        self.move_wakeup_switch = Gtk.Switch()
+        self.move_wakeup_switch.connect("notify::active",
+            lambda w, _p: (self._sync_field("move_wakeup", w.get_active()),
+                           self._debounce(self._write_sleep) if not self._guard else None))
+        wake_row.append(self.move_wakeup_switch)
+        box.append(wake_row)
         return box
 
     def _build_danger_section(self):
@@ -1167,11 +1143,9 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                 self.polling_combo.set_selected(POLLING_RATES.index(self.profile.polling))
             except ValueError:
                 self.polling_combo.set_selected(POLLING_RATES.index(1000))
-            light_idx = next((i for i, (mode, _) in enumerate(LIGHT_MODES)
-                              if mode == self.profile.light_mode), 1)
-            self.light_combo.set_selected(light_idx)
             # sleep
             self.sleep_spin.set_value(self.profile.sleep_seconds)
+            self.move_wakeup_switch.set_active(bool(self.profile.move_wakeup))
             # dpi
             self.dpi_active_combo.set_selected(min(self.profile.dpi_active, NSTAGES-1))
             self.dpi_count_spin.set_value(self.profile.dpi_count)
@@ -1179,7 +1153,6 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                 self.stage_rows[i]["spin"].set_value(s.x_cpi)
                 self.stage_rows[i]["slider"].set_value(s.x_cpi)
                 self.stage_rows[i]["sync_color"](s.rgb)
-                self.stage_rows[i]["led"].set_active(s.flag == 0xff)
             self._update_stage_sensitivity()
             # buttons
             for i, btn in enumerate(self.profile.buttons):
@@ -1488,7 +1461,6 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         debug("WRITE dpi: " + " ".join(parts))
         self._run_write_commands([
             (("dpi", *parts), 5),
-            (self._light_mode_command(), 5),
         ])
 
     def _write_colors(self):
@@ -1502,7 +1474,6 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         debug("WRITE colors: " + " ".join(parts))
         self._run_write_commands([
             (("write-colors", *parts), 5),
-            (self._light_mode_command(), 5),
         ])
 
     def _write_buttons(self):
@@ -1515,7 +1486,6 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         debug("WRITE buttons: " + " ".join(parts))
         self._run_write_commands([
             (("write-buttons", *parts), 5),
-            (self._light_mode_command(), 5),
         ])
 
     def _write_polling(self):
@@ -1524,29 +1494,16 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         debug(f"WRITE polling: {self.profile.polling}")
         self._run_write_commands([
             (("polling", str(self.profile.polling)), 5),
-            (self._light_mode_command(), 5),
-        ])
-
-    def _write_light_mode(self):
-        if not self._write_allowed("light-mode"):
-            return
-        debug(f"WRITE light-mode: {self.profile.light_mode}")
-        self._run_write_commands([
-            (self._light_mode_command(), 5),
         ])
 
     def _write_sleep(self):
         if not self._write_allowed("sleep"):
             return
-        debug(f"WRITE sleep: {self.profile.sleep_seconds}")
+        debug(f"WRITE sleep: {self.profile.sleep_seconds}, move_wakeup={1 if self.profile.move_wakeup else 0}")
         self._run_write_commands([
-            (("sleep", str(self.profile.sleep_seconds)), 5),
-            (self._light_mode_command(), 5),
+            (("sleep", str(self.profile.sleep_seconds),
+              "1" if self.profile.move_wakeup else "0"), 5),
         ])
-
-    def _light_mode_command(self):
-        mode = self.profile.light_mode if 1 <= self.profile.light_mode <= 6 else 2
-        return ("light-mode", str(mode))
 
     def do_factory_reset(self):
         dlg = Gtk.AlertDialog()

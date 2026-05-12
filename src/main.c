@@ -19,15 +19,13 @@ static void usage(const char *p)
 "  %s dpi       <active 0-5> <count 1-6> <X1[/Y1]> ...\n"
 "               (cpi range 100..10000; snaps to 100 below 5000, to 500 at/above 5000)\n"
 "  %s color     <stage 0-5> <#RRGGBB>\n"
-"  %s sleep     <seconds>\n"
-"  %s light-mode <1-6|flow|breathing|static|neon|wave|off> [b5 b6 b7]\n"
-"  %s light     <mode>         alias for light-mode\n"
-"  %s static-light             historical mode-2 light frame\n"
-"  %s commit                   alias for historical mode-2 frame\n"
+"  %s sleep     <seconds> [move-wakeup]\n"
+"               second-stage sleep; seconds multiple of 10, max 2550\n"
+"  %s move-wakeup <0|1>        1=wake by movement/click, 0=click only\n"
 "  %s factory-reset              restore firmware defaults (repairs inert DPI key)\n"
 "\n"
 "Profiles (host-side; switching = rewrite full config):\n"
-"  %s apply        <profile.cfg>     write all 6 frames in one go\n"
+"  %s apply        <profile.cfg>     write the verified config frames\n"
 "  %s save-default <profile.cfg>     emit a default-config template\n"
 "\n"
 "Button mapping:\n"
@@ -47,7 +45,7 @@ static void usage(const char *p)
 "  %s recv      [timeout-ms]\n"
 "  %s monitor\n"
 "  %s watch     monitor decoded battery & DPI events\n",
-    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
+    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
 }
 
 static int hex_to_byte(const char *s, uint8_t *out)
@@ -86,47 +84,6 @@ static int parse_bounded_uint_arg(const char *s, unsigned min,
     unsigned long v = strtoul(s, &e, 0);
     if (!s[0] || *e || v < min || v > max) return -EINVAL;
     *out = (unsigned)v;
-    return 0;
-}
-
-static const char *light_mode_name(uint8_t mode)
-{
-    switch (mode) {
-    case 1: return "flow";
-    case 2: return "breathing";
-    case 3: return "static";
-    case 4: return "neon";
-    case 5: return "wave";
-    case 6: return "off";
-    default: return "unknown";
-    }
-}
-
-static int parse_light_mode(const char *s, uint8_t *mode)
-{
-    char *e = NULL;
-    unsigned long v = strtoul(s, &e, 0);
-    if (e && *e == 0) {
-        if (v < 1 || v > 6) return -EINVAL;
-        *mode = (uint8_t)v;
-        return 0;
-    }
-
-    if (!strcasecmp(s, "flow") || !strcasecmp(s, "stream")) {
-        *mode = 1;
-    } else if (!strcasecmp(s, "breathing") || !strcasecmp(s, "breath")) {
-        *mode = 2;
-    } else if (!strcasecmp(s, "static") || !strcasecmp(s, "constant")) {
-        *mode = 3;
-    } else if (!strcasecmp(s, "neon")) {
-        *mode = 4;
-    } else if (!strcasecmp(s, "wave") || !strcasecmp(s, "rainbow-wave")) {
-        *mode = 5;
-    } else if (!strcasecmp(s, "off") || !strcasecmp(s, "close")) {
-        *mode = 6;
-    } else {
-        return -EINVAL;
-    }
     return 0;
 }
 
@@ -269,32 +226,12 @@ static int do_color(struct sc360se_device *dev, int argc, char **argv)
     if (argc != 4) return -EINVAL;
     int idx = atoi(argv[2]);
     if (idx < 0 || idx >= SC360SE_NSTAGES) return -EINVAL;
-    struct sc360se_dpi_config c = {0};
-    for (int i = 0; i < SC360SE_NSTAGES; i++) {
-        c.stage[i].r = c.stage[i].g = c.stage[i].b = 0xff;
-        c.stage[i].flag = 0xff;
-    }
-    if (parse_color(argv[3], &c.stage[idx].r, &c.stage[idx].g,
-                    &c.stage[idx].b) < 0) return -EINVAL;
-    return sc360se_set_dpi_colors(dev, &c);
-}
-
-static int do_light_mode(struct sc360se_device *dev, int argc, char **argv)
-{
-    if (argc != 3 && argc != 6) return -EINVAL;
-
-    uint8_t mode = 0;
-    if (parse_light_mode(argv[2], &mode) < 0) return -EINVAL;
-
-    if (argc == 3)
-        return sc360se_set_light_mode(dev, mode);
-
-    uint8_t byte5 = 0, byte6 = 0, byte7 = 0;
-    if (hex_to_byte(argv[3], &byte5) < 0 ||
-        hex_to_byte(argv[4], &byte6) < 0 ||
-        hex_to_byte(argv[5], &byte7) < 0)
-        return -EINVAL;
-    return sc360se_set_light_payload(dev, mode, byte5, byte6, byte7);
+    struct sc360se_profile p;
+    int rc = sc360se_read_config(dev, &p);
+    if (rc < 0) return rc;
+    if (parse_color(argv[3], &p.dpi.stage[idx].r, &p.dpi.stage[idx].g,
+                    &p.dpi.stage[idx].b) < 0) return -EINVAL;
+    return sc360se_set_dpi_colors(dev, &p.dpi);
 }
 
 static int do_send(struct sc360se_device *dev, int argc, char **argv)
@@ -346,7 +283,7 @@ static int do_read(struct sc360se_device *dev)
              (p.polling == SC360SE_HZ_250)  ? 250  : 125;
     printf("polling    : %d Hz\n", hz);
     printf("sleep      : %u s\n", p.sleep_seconds);
-    printf("light.mode : %u %s\n", p.light_mode, light_mode_name(p.light_mode));
+    printf("move.wakeup: %u\n", p.move_wakeup);
     printf("dpi.active : %u\n", p.dpi.active);
     printf("dpi.count  : %u\n", p.dpi.count);
     for (int i = 0; i < SC360SE_NSTAGES; i++) {
@@ -481,13 +418,30 @@ int main(int argc, char **argv)
     }
     else if (!strcmp(cmd, "dpi"))     r = do_dpi(&dev, argc, argv);
     else if (!strcmp(cmd, "color"))   r = do_color(&dev, argc, argv);
-    else if (!strcmp(cmd, "sleep") && argc == 3)
-        r = sc360se_set_sleep_seconds(&dev, (uint16_t)atoi(argv[2]));
-    else if (!strcmp(cmd, "light-mode") || !strcmp(cmd, "light"))
-        r = do_light_mode(&dev, argc, argv);
+    else if (!strcmp(cmd, "sleep") && (argc == 3 || argc == 4)) {
+        unsigned seconds = 0, move_wakeup = 1;
+        if (parse_bounded_uint_arg(argv[2], 0, SC360SE_SLEEP_MAX_SECONDS, &seconds) < 0)
+            r = -EINVAL;
+        else if (argc == 4 &&
+                 parse_bounded_uint_arg(argv[3], 0, 1, &move_wakeup) < 0)
+            r = -EINVAL;
+        else
+            r = sc360se_set_power_management(&dev, (uint16_t)seconds,
+                                             (uint8_t)move_wakeup);
+    }
+    else if (!strcmp(cmd, "move-wakeup") && argc == 3) {
+        unsigned enabled = 0;
+        if (parse_bounded_uint_arg(argv[2], 0, 1, &enabled) < 0) {
+            r = -EINVAL;
+        } else {
+            struct sc360se_profile p;
+            r = sc360se_read_config(&dev, &p);
+            if (r == 0)
+                r = sc360se_set_power_management(&dev, p.sleep_seconds,
+                                                 (uint8_t)enabled);
+        }
+    }
     else if (!strcmp(cmd, "button"))  r = do_button(&dev, argc, argv);
-    else if (!strcmp(cmd, "static-light")) r = sc360se_set_static_light(&dev);
-    else if (!strcmp(cmd, "commit"))  r = sc360se_commit(&dev);
     else if (!strcmp(cmd, "factory-reset")) r = sc360se_factory_reset(&dev);
     else if (!strcmp(cmd, "apply") && argc == 3) {
         struct sc360se_profile p;

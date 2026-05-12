@@ -48,12 +48,19 @@ int main(void)
     check("polling 500 Hz",
           f, "0200010102000000000000000000000000000000000000000000000000000002");
 
-    /* sleep 90 s */
+    /* power management: 15 min second-stage sleep + move wakeup off */
     memset(f, 0, sizeof(f));
-    f[0]=0x07; f[2]=0x01; f[3]=0x04; f[4]=0x5a; f[7]=0x08;
+    f[0]=0x07; f[2]=0x01; f[3]=0x04; f[4]=0x5a; f[5]=0x00; f[7]=0x08;
     f[31] = sc360se_checksum(f);
-    check("sleep 90 s",
+    check("sleep 900 s, move wakeup off",
           f, "070001045a000008000000000000000000000000000000000000000000000062");
+
+    /* power management: 30 min second-stage sleep + move wakeup on */
+    memset(f, 0, sizeof(f));
+    f[0]=0x07; f[2]=0x01; f[3]=0x04; f[4]=0xb4; f[5]=0x01; f[7]=0x08;
+    f[31] = sc360se_checksum(f);
+    check("sleep 1800 s, move wakeup on",
+          f, "07000104b40100080000000000000000000000000000000000000000000000bd");
 
     /* DPI 6-stage 800/1600/2400/3200/5300/6000, active=1 */
     memset(f, 0, sizeof(f));
@@ -188,26 +195,6 @@ int main(void)
     f[31] = sc360se_checksum(f);
     check("Profile 3 (Office) DPI",
           f, "03000125230a000a00140014001e001e0020002000320032003c003c000000b7");
-
-    /* Historical XML/default mode-2 light frame. */
-    memset(f, 0, sizeof(f));
-    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x02;
-    f[31] = sc360se_checksum(f);
-    check("historical mode-2 light frame",
-          f, "0600010502000000000000000000000000000000000000000000000000000002");
-
-    /* XML light modes 1..6 use the same 0x06/0x05 command. */
-    memset(f, 0, sizeof(f));
-    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x01;
-    f[31] = sc360se_checksum(f);
-    check("light mode 1 flow",
-          f, "0600010501000000000000000000000000000000000000000000000000000001");
-
-    memset(f, 0, sizeof(f));
-    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x06; f[6]=0x01;
-    f[31] = sc360se_checksum(f);
-    check("light mode 6 off with byte6",
-          f, "0600010506000100000000000000000000000000000000000000000000000007");
 
     /* Factory reset — from DPI配置.pcapng frame #9955 / #33257 */
     memset(f, 0, sizeof(f));

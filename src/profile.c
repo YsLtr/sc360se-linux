@@ -11,8 +11,7 @@
  *   2. 0x03 0x25  DPI
  *   3. 0x04 0x12  DPI colors
  *   4. 0x02 0x01  polling rate
- *   5. 0x06 0x05  DPI light mode
- *   6. 0x07 0x04  sleep timeout
+ *   5. 0x07 0x04  power management
  */
 
 #define _GNU_SOURCE
@@ -31,18 +30,22 @@ void sc360se_profile_default(struct sc360se_profile *p)
 {
     memset(p, 0, sizeof(*p));
     p->polling          = SC360SE_HZ_1000;
-    p->light_mode       = SC360SE_LIGHT_XML_DEFAULT;
-    p->sleep_seconds    = 90;
+    p->sleep_seconds    = 900;
+    p->move_wakeup      = 1;
     p->dpi.active       = 0;
-    p->dpi.count        = 5;
-    static const uint16_t cpis[6] = {800, 1600, 2400, 3200, 5200, 6000};
+    p->dpi.count        = 6;
+    static const uint16_t cpis[6] = {800, 1600, 2400, 3200, 6500, 10000};
+    static const uint8_t colors[6][3] = {
+        {0xff, 0x00, 0x00}, {0x00, 0xff, 0x00}, {0x00, 0x00, 0xff},
+        {0xff, 0x00, 0xff}, {0xff, 0xff, 0x00}, {0x00, 0xff, 0xff},
+    };
     for (int i = 0; i < SC360SE_NSTAGES; i++) {
         p->dpi.stage[i].x_cpi = cpis[i];
         p->dpi.stage[i].y_cpi = cpis[i];
-        p->dpi.stage[i].r = 0xff;
-        p->dpi.stage[i].g = 0xff;
-        p->dpi.stage[i].b = 0xff;
-        p->dpi.stage[i].flag = 0xff;
+        p->dpi.stage[i].r = colors[i][0];
+        p->dpi.stage[i].g = colors[i][1];
+        p->dpi.stage[i].b = colors[i][2];
+        p->dpi.stage[i].flag = 0x00;
     }
     p->buttons[0] = (struct sc360se_button_action){SC360SE_ACT_MOUSE, SC360SE_MB_LEFT,    0};
     p->buttons[1] = (struct sc360se_button_action){SC360SE_ACT_MOUSE, SC360SE_MB_RIGHT,   0};
@@ -74,9 +77,8 @@ int sc360se_apply_profile(struct sc360se_device *dev,
     nanosleep(&gap, NULL);
     if ((rc = sc360se_set_polling_rate(dev, p->polling)) < 0) return rc;
     nanosleep(&gap, NULL);
-    if ((rc = sc360se_set_light_mode(dev, p->light_mode)) < 0) return rc;
-    nanosleep(&gap, NULL);
-    if ((rc = sc360se_set_sleep_seconds(dev, p->sleep_seconds)) < 0) return rc;
+    if ((rc = sc360se_set_power_management(dev, p->sleep_seconds,
+                                           p->move_wakeup)) < 0) return rc;
     return 0;
 }
 
@@ -106,8 +108,8 @@ int sc360se_profile_save(const char *path, const struct sc360se_profile *p)
              (p->polling == SC360SE_HZ_500)  ? 500  :
              (p->polling == SC360SE_HZ_250)  ? 250  : 125;
     fprintf(f, "polling = %d\n", hz);
-    fprintf(f, "light.mode = %u\n", p->light_mode);
     fprintf(f, "sleep   = %u\n", p->sleep_seconds);
+    fprintf(f, "move.wakeup = %u\n", p->move_wakeup ? 1 : 0);
     fprintf(f, "dpi.active = %u\n", p->dpi.active);
     fprintf(f, "dpi.count  = %u\n", p->dpi.count);
     for (int i = 0; i < SC360SE_NSTAGES; i++) {
@@ -176,12 +178,10 @@ int sc360se_profile_load(const char *path, struct sc360se_profile *out)
             out->polling = (hz == 1000) ? SC360SE_HZ_1000 :
                            (hz == 500)  ? SC360SE_HZ_500  :
                            (hz == 250)  ? SC360SE_HZ_250  : SC360SE_HZ_125;
-        } else if (!strcmp(key, "light.mode")) {
-            unsigned mode = (unsigned)strtoul(val, NULL, 0);
-            if (mode >= 1 && mode <= 6)
-                out->light_mode = (uint8_t)mode;
         } else if (!strcmp(key, "sleep")) {
             out->sleep_seconds = (uint16_t)atoi(val);
+        } else if (!strcmp(key, "move.wakeup")) {
+            out->move_wakeup = atoi(val) ? 1 : 0;
         } else if (!strcmp(key, "dpi.active")) {
             out->dpi.active = (uint8_t)atoi(val);
         } else if (!strcmp(key, "dpi.count")) {
@@ -210,5 +210,11 @@ int sc360se_profile_load(const char *path, struct sc360se_profile *out)
         }
     }
     fclose(f);
+    if (out->sleep_seconds > SC360SE_SLEEP_MAX_SECONDS)
+        out->sleep_seconds = SC360SE_SLEEP_MAX_SECONDS;
+    out->sleep_seconds =
+        (uint16_t)((out->sleep_seconds / SC360SE_SLEEP_UNIT_SECONDS) *
+                   SC360SE_SLEEP_UNIT_SECONDS);
+    out->move_wakeup = out->move_wakeup ? 1 : 0;
     return 0;
 }
