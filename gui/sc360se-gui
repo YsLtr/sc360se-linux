@@ -408,6 +408,10 @@ CSS = b"""
 .muted        { color: alpha(@theme_fg_color, 0.55); }
 .success      { color: #2ec27e; }
 .error        { color: #e01b24; }
+.battery-status label { font-weight: 700; }
+.battery-good { color: #2ec27e; }
+.battery-warn { color: #f5c211; }
+.battery-low  { color: #e01b24; }
 .stage-row    { padding: 6px; border-radius: 6px; }
 .stage-row.disabled { opacity: 0.4; }
 .color-button { padding: 4px 8px; }
@@ -494,17 +498,55 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
     def _build_status(self):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        status_icons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.dot = Gtk.Label(label="●")
         self.dot.add_css_class("muted")
+        status_icons.append(self.dot)
+        self.battery_status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        self.battery_status.add_css_class("battery-status")
+        self.battery_icon = Gtk.Image.new_from_icon_name("battery-missing-symbolic")
+        self.battery_icon.set_pixel_size(18)
+        self.battery_status.append(self.battery_icon)
+        self.battery_label = Gtk.Label(label="")
+        self.battery_status.append(self.battery_label)
+        self._set_battery(None)
+        status_icons.append(self.battery_status)
         self.status_label = Gtk.Label(label="Detecting device…")
         self.status_label.set_xalign(0)
         self.status_label.set_hexpand(True)
-        box.append(self.dot)
+        box.append(status_icons)
         box.append(self.status_label)
-        self.battery_label = Gtk.Label(label="")
-        self.battery_label.add_css_class("muted")
-        box.append(self.battery_label)
         return box
+
+    def _set_battery(self, pct):
+        for css_class in ("muted", "battery-good", "battery-warn", "battery-low"):
+            self.battery_status.remove_css_class(css_class)
+
+        if pct is None:
+            self.battery_icon.set_from_icon_name("battery-missing-symbolic")
+            self.battery_label.set_text("")
+            self.battery_status.add_css_class("muted")
+            self.battery_status.set_tooltip_text("Battery level unavailable")
+            return
+
+        pct = max(0, min(100, int(pct)))
+        if pct <= 20:
+            icon = "battery-low-symbolic"
+            css_class = "battery-low"
+            state = "low"
+        elif pct <= 50:
+            icon = "battery-good-symbolic"
+            css_class = "battery-warn"
+            state = "medium"
+        else:
+            icon = "battery-full-symbolic"
+            css_class = "battery-good"
+            state = "good"
+
+        self.battery_icon.set_from_icon_name(icon)
+        self.battery_label.set_text(f"{pct}%")
+        self.battery_status.add_css_class(css_class)
+        self.battery_status.set_tooltip_text(f"Mouse battery: {pct}% ({state})")
 
     def _build_profile_bar(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1294,6 +1336,13 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                    line.startswith("link") or line.startswith("device"):
                     info_parts.append(line)
             self.status_label.set_text("  ·  ".join(info_parts))
+            try:
+                status_out = run_cli(self.cli, "status", timeout=5)
+                m = re.search(r"\bbattery=(\d+)\b", status_out)
+                if m:
+                    self._set_battery(int(m.group(1)))
+            except (CliError, FileNotFoundError, ValueError) as e:
+                debug(f"refresh_device: battery status unavailable: {e}")
 
             self._start_watch()
         except (CliError, FileNotFoundError, ValueError) as e:
@@ -1301,7 +1350,7 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             self.dot.remove_css_class("success")
             self.dot.add_css_class("error")
             self.status_label.set_text(f"Not connected: {e}")
-            self.battery_label.set_text("")
+            self._set_battery(None)
             self._write_enabled = False
             if self._enable_writes_src:
                 GLib.source_remove(self._enable_writes_src)
@@ -1375,12 +1424,13 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         # battery: 92%
         elif line.startswith("battery: "):
             pct = line.split(": ", 1)[1].rstrip("%")
-            self.battery_label.set_text(f"Battery: {pct}")
+            self._set_battery(pct)
         elif line == "link: disconnected":
             self._write_enabled = False
             self.dot.remove_css_class("success")
             self.dot.add_css_class("error")
             self.status_label.set_text("Mouse disconnected or asleep")
+            self._set_battery(None)
         elif line == "link: connected":
             self.dot.remove_css_class("error")
             self.dot.add_css_class("muted")
