@@ -13,6 +13,7 @@
 #define SC360SE_FRAME_LEN   32
 #define SC360SE_NSTAGES     6
 #define SC360SE_NBUTTONS    6
+#define SC360SE_LIGHT_XML_DEFAULT 0x02
 
 enum sc360se_link {
     SC360SE_LINK_USB = 0,
@@ -138,6 +139,9 @@ int sc360se_set_dpi(struct sc360se_device *dev,
                     const struct sc360se_dpi_config *cfg);
 int sc360se_set_dpi_colors(struct sc360se_device *dev,
                            const struct sc360se_dpi_config *cfg);
+int sc360se_set_light_mode(struct sc360se_device *dev, uint8_t mode);
+int sc360se_set_light_payload(struct sc360se_device *dev, uint8_t mode,
+                              uint8_t byte5, uint8_t byte6, uint8_t byte7);
 int sc360se_set_static_light(struct sc360se_device *dev);
 int sc360se_set_sleep_seconds(struct sc360se_device *dev, uint16_t seconds);
 int sc360se_set_buttons(struct sc360se_device *dev,
@@ -155,6 +159,7 @@ struct sc360se_profile {
     enum sc360se_polling_rate    polling;
     struct sc360se_dpi_config    dpi;
     struct sc360se_button_action buttons[SC360SE_NBUTTONS];
+    uint8_t                      light_mode;
     uint16_t                     sleep_seconds;
 };
 

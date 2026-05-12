@@ -168,12 +168,25 @@ int main(void)
     check("Profile 3 (Office) DPI",
           f, "03000125230a000a00140014001e001e0020002000320032003c003c000000b7");
 
-    /* Static DPI light restore — verified live after host-side DPI writes */
+    /* Historical XML/default mode-2 light frame. */
     memset(f, 0, sizeof(f));
     f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x02;
     f[31] = sc360se_checksum(f);
-    check("static DPI light (op 0x06)",
+    check("historical mode-2 light frame",
           f, "0600010502000000000000000000000000000000000000000000000000000002");
+
+    /* XML light modes 1..6 use the same 0x06/0x05 command. */
+    memset(f, 0, sizeof(f));
+    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x01;
+    f[31] = sc360se_checksum(f);
+    check("light mode 1 flow",
+          f, "0600010501000000000000000000000000000000000000000000000000000001");
+
+    memset(f, 0, sizeof(f));
+    f[0]=0x06; f[2]=0x01; f[3]=0x05; f[4]=0x06; f[6]=0x01;
+    f[31] = sc360se_checksum(f);
+    check("light mode 6 off with byte6",
+          f, "0600010506000100000000000000000000000000000000000000000000000007");
 
     /* Factory reset — from DPI配置.pcapng frame #9955 / #33257 */
     memset(f, 0, sizeof(f));

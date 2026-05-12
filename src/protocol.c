@@ -116,10 +116,11 @@ int sc360se_set_dpi(struct sc360se_device *dev,
     if (rc < 0) return rc;
 
     /* Host-side 0x03 DPI writes update the stored active stage but do not
-     * run the firmware's physical-DPI-key path. Live testing showed that
-     * the LED leaves static mode until the Windows static-light frame is
-     * sent again. */
-    return sc360se_set_static_light(dev);
+     * run the firmware's physical-DPI-key runtime path. Earlier testing
+     * guessed that a follow-up 0x06/0x05 mode-2 frame restored constant LED
+     * behavior; later live tests showed that this is not reliable. Keep this
+     * write literal and use light-mode explicitly for LED experiments. */
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -132,8 +133,8 @@ int sc360se_set_dpi(struct sc360se_device *dev,
 /* factory defaults), followed by 6 independent flag bytes.           */
 /*                                                                    */
 /* The six trailing flag bytes are stored by the firmware. Captures of */
-/* normal static DPI lighting use 0x00 for every stage; restoring the  */
-/* live LED state is handled by the separate 0x06 static-light frame.  */
+/* normal static DPI lighting use 0x00 for every stage, but rewriting  */
+/* this table alone has not restored the live constant-light state.    */
 /* ------------------------------------------------------------------ */
 
 int sc360se_set_dpi_colors(struct sc360se_device *dev,
@@ -197,19 +198,37 @@ int sc360se_set_buttons(struct sc360se_device *dev,
 }
 
 /* ------------------------------------------------------------------ */
-/* Static DPI light mode  (op 0x06, sub 0x05)                         */
+/* DPI light mode  (op 0x06, sub 0x05)                                */
 /*                                                                    */
-/* Windows sends this after profile writes. Live testing showed that   */
-/* host-side DPI writes (0x03) make the LED leave static mode, while   */
-/* this exact payload restores the constant DPI LED.                   */
+/* XML names modes 1..6 as flow, breathing, static, neon, wave, off.   */
+/* Live tests showed that every mode value is accepted and can be read */
+/* back through query 0x16. ACK/readback alone does not prove visible  */
+/* LED behavior: the earlier mode-2 static-light inference was refuted */
+/* by later live tests.                                                */
 /* ------------------------------------------------------------------ */
 
-int sc360se_set_static_light(struct sc360se_device *dev)
+int sc360se_set_light_payload(struct sc360se_device *dev, uint8_t mode,
+                              uint8_t byte5, uint8_t byte6, uint8_t byte7)
 {
     uint8_t f[SC360SE_FRAME_LEN];
     frame_init(f, 0x06, 0x01, 0x05);
-    f[4] = 0x02;
+    f[4] = mode;
+    f[5] = byte5;
+    f[6] = byte6;
+    f[7] = byte7;
     return sc360se_send(dev, f);
+}
+
+int sc360se_set_light_mode(struct sc360se_device *dev, uint8_t mode)
+{
+    if (mode < 1 || mode > 6) return -EINVAL;
+    return sc360se_set_light_payload(dev, mode, 0x00, 0x00, 0x00);
+}
+
+int sc360se_set_static_light(struct sc360se_device *dev)
+{
+    return sc360se_set_light_payload(dev, SC360SE_LIGHT_XML_DEFAULT,
+                                     0x00, 0x00, 0x00);
 }
 
 int sc360se_commit(struct sc360se_device *dev)
@@ -306,10 +325,11 @@ enum {
     GOT_DPI     = 1u << 2,
     GOT_COLORS  = 1u << 3,
     GOT_SLEEP   = 1u << 4,
+    GOT_LIGHT   = 1u << 5,
 };
 
 static const unsigned READ_NEED = GOT_BUTTONS | GOT_POLLING | GOT_DPI |
-                                  GOT_COLORS  | GOT_SLEEP;
+                                  GOT_COLORS  | GOT_SLEEP | GOT_LIGHT;
 
 static const char *read_flag_name(unsigned flag)
 {
@@ -319,6 +339,7 @@ static const char *read_flag_name(unsigned flag)
     case GOT_DPI:     return "dpi";
     case GOT_COLORS:  return "colors";
     case GOT_SLEEP:   return "sleep";
+    case GOT_LIGHT:   return "light";
     default:          return "?";
     }
 }
@@ -429,6 +450,13 @@ static unsigned parse_config_reply(struct sc360se_device *dev,
             }
             *got |= GOT_COLORS;
             return GOT_COLORS;
+        }
+        break;
+    case 0x16:
+        if (in[3] == 0x05) {
+            out->light_mode = in[4];
+            *got |= GOT_LIGHT;
+            return GOT_LIGHT;
         }
         break;
     case 0x17:
@@ -599,6 +627,7 @@ int sc360se_read_config(struct sc360se_device *dev,
         if ((rc = resend_missing_query(dev, out, &got, GOT_POLLING, 0x12, &ack_only_count)) < 0) return rc;
         if ((rc = resend_missing_query(dev, out, &got, GOT_DPI,     0x13, &ack_only_count)) < 0) return rc;
         if ((rc = resend_missing_query(dev, out, &got, GOT_COLORS,  0x14, &ack_only_count)) < 0) return rc;
+        if ((rc = resend_missing_query(dev, out, &got, GOT_LIGHT,   0x16, &ack_only_count)) < 0) return rc;
         if ((rc = resend_missing_query(dev, out, &got, GOT_SLEEP,   0x17, &ack_only_count)) < 0) return rc;
         if (got == before) break;
         if ((got & READ_NEED) != READ_NEED) sleep_ms(60);
@@ -618,13 +647,14 @@ int sc360se_read_config(struct sc360se_device *dev,
         if (debug_enabled()) {
             fprintf(stderr,
                     "[sc360se] incomplete read_config: got=0x%02x need=0x%02x"
-                    " missing:%s%s%s%s%s\n",
+                    " missing:%s%s%s%s%s%s\n",
                     got, need,
                     (got & GOT_BUTTONS) ? "" : " buttons",
                     (got & GOT_POLLING) ? "" : " polling",
                     (got & GOT_DPI)     ? "" : " dpi",
                     (got & GOT_COLORS)  ? "" : " colors",
-                    (got & GOT_SLEEP)   ? "" : " sleep");
+                    (got & GOT_SLEEP)   ? "" : " sleep",
+                    (got & GOT_LIGHT)   ? "" : " light");
         }
         return -ENODATA;
     }

@@ -20,8 +20,10 @@ static void usage(const char *p)
 "               (cpi snaps to 100 below 5000, to 500 at/above 5000)\n"
 "  %s color     <stage 0-5> <#RRGGBB>\n"
 "  %s sleep     <seconds>\n"
-"  %s static-light             restore static DPI LED mode\n"
-"  %s commit                   alias for static-light\n"
+"  %s light-mode <1-6|flow|breathing|static|neon|wave|off> [b5 b6 b7]\n"
+"  %s light     <mode>         alias for light-mode\n"
+"  %s static-light             historical mode-2 light frame\n"
+"  %s commit                   alias for historical mode-2 frame\n"
 "  %s factory-reset              restore firmware defaults (repairs inert DPI key)\n"
 "\n"
 "Profiles (host-side; switching = rewrite full config):\n"
@@ -45,7 +47,7 @@ static void usage(const char *p)
 "  %s recv      [timeout-ms]\n"
 "  %s monitor\n"
 "  %s watch     monitor decoded battery & DPI events\n",
-    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
+    p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p,p);
 }
 
 static int hex_to_byte(const char *s, uint8_t *out)
@@ -65,6 +67,47 @@ static int parse_color(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)
     *r = (uint8_t)strtoul(rs, NULL, 16);
     *g = (uint8_t)strtoul(gs, NULL, 16);
     *b = (uint8_t)strtoul(bs, NULL, 16);
+    return 0;
+}
+
+static const char *light_mode_name(uint8_t mode)
+{
+    switch (mode) {
+    case 1: return "flow";
+    case 2: return "breathing";
+    case 3: return "static";
+    case 4: return "neon";
+    case 5: return "wave";
+    case 6: return "off";
+    default: return "unknown";
+    }
+}
+
+static int parse_light_mode(const char *s, uint8_t *mode)
+{
+    char *e = NULL;
+    unsigned long v = strtoul(s, &e, 0);
+    if (e && *e == 0) {
+        if (v < 1 || v > 6) return -EINVAL;
+        *mode = (uint8_t)v;
+        return 0;
+    }
+
+    if (!strcasecmp(s, "flow") || !strcasecmp(s, "stream")) {
+        *mode = 1;
+    } else if (!strcasecmp(s, "breathing") || !strcasecmp(s, "breath")) {
+        *mode = 2;
+    } else if (!strcasecmp(s, "static") || !strcasecmp(s, "constant")) {
+        *mode = 3;
+    } else if (!strcasecmp(s, "neon")) {
+        *mode = 4;
+    } else if (!strcasecmp(s, "wave") || !strcasecmp(s, "rainbow-wave")) {
+        *mode = 5;
+    } else if (!strcasecmp(s, "off") || !strcasecmp(s, "close")) {
+        *mode = 6;
+    } else {
+        return -EINVAL;
+    }
     return 0;
 }
 
@@ -181,8 +224,7 @@ static int do_dpi(struct sc360se_device *dev, int argc, char **argv)
         int y = slash ? atoi(slash + 1) : x;
         c.stage[i].x_cpi = (uint16_t)x;
         c.stage[i].y_cpi = (uint16_t)y;
-        /* Color flags are not part of the 0x03 DPI frame; static LED
-         * restoration is performed by sc360se_set_dpi() after the write. */
+        /* Color flags are not part of the 0x03 DPI frame. */
         c.stage[i].flag = 0xff;
     }
     return sc360se_set_dpi(dev, &c);
@@ -201,6 +243,24 @@ static int do_color(struct sc360se_device *dev, int argc, char **argv)
     if (parse_color(argv[3], &c.stage[idx].r, &c.stage[idx].g,
                     &c.stage[idx].b) < 0) return -EINVAL;
     return sc360se_set_dpi_colors(dev, &c);
+}
+
+static int do_light_mode(struct sc360se_device *dev, int argc, char **argv)
+{
+    if (argc != 3 && argc != 6) return -EINVAL;
+
+    uint8_t mode = 0;
+    if (parse_light_mode(argv[2], &mode) < 0) return -EINVAL;
+
+    if (argc == 3)
+        return sc360se_set_light_mode(dev, mode);
+
+    uint8_t byte5 = 0, byte6 = 0, byte7 = 0;
+    if (hex_to_byte(argv[3], &byte5) < 0 ||
+        hex_to_byte(argv[4], &byte6) < 0 ||
+        hex_to_byte(argv[5], &byte7) < 0)
+        return -EINVAL;
+    return sc360se_set_light_payload(dev, mode, byte5, byte6, byte7);
 }
 
 static int do_send(struct sc360se_device *dev, int argc, char **argv)
@@ -252,6 +312,7 @@ static int do_read(struct sc360se_device *dev)
              (p.polling == SC360SE_HZ_250)  ? 250  : 125;
     printf("polling    : %d Hz\n", hz);
     printf("sleep      : %u s\n", p.sleep_seconds);
+    printf("light.mode : %u %s\n", p.light_mode, light_mode_name(p.light_mode));
     printf("dpi.active : %u\n", p.dpi.active);
     printf("dpi.count  : %u\n", p.dpi.count);
     for (int i = 0; i < SC360SE_NSTAGES; i++) {
@@ -388,6 +449,8 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "color"))   r = do_color(&dev, argc, argv);
     else if (!strcmp(cmd, "sleep") && argc == 3)
         r = sc360se_set_sleep_seconds(&dev, (uint16_t)atoi(argv[2]));
+    else if (!strcmp(cmd, "light-mode") || !strcmp(cmd, "light"))
+        r = do_light_mode(&dev, argc, argv);
     else if (!strcmp(cmd, "button"))  r = do_button(&dev, argc, argv);
     else if (!strcmp(cmd, "static-light")) r = sc360se_set_static_light(&dev);
     else if (!strcmp(cmd, "commit"))  r = sc360se_commit(&dev);

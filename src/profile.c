@@ -11,7 +11,7 @@
  *   2. 0x03 0x25  DPI
  *   3. 0x04 0x12  DPI colors
  *   4. 0x02 0x01  polling rate
- *   5. 0x06 0x05  static DPI light mode
+ *   5. 0x06 0x05  DPI light mode
  *   6. 0x07 0x04  sleep timeout
  */
 
@@ -31,6 +31,7 @@ void sc360se_profile_default(struct sc360se_profile *p)
 {
     memset(p, 0, sizeof(*p));
     p->polling          = SC360SE_HZ_1000;
+    p->light_mode       = SC360SE_LIGHT_XML_DEFAULT;
     p->sleep_seconds    = 90;
     p->dpi.active       = 0;
     p->dpi.count        = 5;
@@ -73,7 +74,7 @@ int sc360se_apply_profile(struct sc360se_device *dev,
     nanosleep(&gap, NULL);
     if ((rc = sc360se_set_polling_rate(dev, p->polling)) < 0) return rc;
     nanosleep(&gap, NULL);
-    if ((rc = sc360se_set_static_light(dev)) < 0) return rc;
+    if ((rc = sc360se_set_light_mode(dev, p->light_mode)) < 0) return rc;
     nanosleep(&gap, NULL);
     if ((rc = sc360se_set_sleep_seconds(dev, p->sleep_seconds)) < 0) return rc;
     return 0;
@@ -105,6 +106,7 @@ int sc360se_profile_save(const char *path, const struct sc360se_profile *p)
              (p->polling == SC360SE_HZ_500)  ? 500  :
              (p->polling == SC360SE_HZ_250)  ? 250  : 125;
     fprintf(f, "polling = %d\n", hz);
+    fprintf(f, "light.mode = %u\n", p->light_mode);
     fprintf(f, "sleep   = %u\n", p->sleep_seconds);
     fprintf(f, "dpi.active = %u\n", p->dpi.active);
     fprintf(f, "dpi.count  = %u\n", p->dpi.count);
@@ -174,6 +176,10 @@ int sc360se_profile_load(const char *path, struct sc360se_profile *out)
             out->polling = (hz == 1000) ? SC360SE_HZ_1000 :
                            (hz == 500)  ? SC360SE_HZ_500  :
                            (hz == 250)  ? SC360SE_HZ_250  : SC360SE_HZ_125;
+        } else if (!strcmp(key, "light.mode")) {
+            unsigned mode = (unsigned)strtoul(val, NULL, 0);
+            if (mode >= 1 && mode <= 6)
+                out->light_mode = (uint8_t)mode;
         } else if (!strcmp(key, "sleep")) {
             out->sleep_seconds = (uint16_t)atoi(val);
         } else if (!strcmp(key, "dpi.active")) {

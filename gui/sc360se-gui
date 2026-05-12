@@ -84,6 +84,15 @@ POLLING_RATES = [125, 250, 500, 1000]
 NSTAGES = 6
 NBUTTONS = 6
 
+LIGHT_MODES = [
+    (1, "1 Flow"),
+    (2, "2 Breathing"),
+    (3, "3 Static"),
+    (4, "4 Neon"),
+    (5, "5 Wave"),
+    (6, "6 Off"),
+]
+
 BUTTON_LABELS = [
     "Left",
     "Right",
@@ -162,6 +171,7 @@ class Button:
 @dataclass
 class Profile:
     polling: int = 1000
+    light_mode: int = 2
     sleep_seconds: int = 90
     dpi_active: int = 0
     dpi_count: int = 5
@@ -202,6 +212,10 @@ class Profile:
 
             if k == "polling":
                 p.polling = int(v)
+            elif k == "light.mode":
+                mode = int(v.split()[0], 0)
+                if 1 <= mode <= 6:
+                    p.light_mode = mode
             elif k == "sleep":
                 p.sleep_seconds = int(v)
             elif k == "dpi.active":
@@ -250,6 +264,9 @@ class Profile:
             elif k == "sleep":
                 p.sleep_seconds = int(v.rstrip("s").strip())
                 seen.add("sleep")
+            elif k == "light.mode":
+                p.light_mode = int(v.split()[0], 0)
+                seen.add("light.mode")
             elif k == "dpi.active":
                 p.dpi_active = int(v)
                 seen.add("dpi.active")
@@ -293,6 +310,7 @@ class Profile:
     def save(self, path: Path):
         lines = ["# AULA SC360SE profile",
                  f"polling = {self.polling}",
+                 f"light.mode = {self.light_mode}",
                  f"sleep   = {self.sleep_seconds}",
                  f"dpi.active = {self.dpi_active}",
                  f"dpi.count  = {self.dpi_count}"]
@@ -334,6 +352,7 @@ def profile_summary(p: Profile) -> str:
     buttons = ", ".join(f"{i}:{b.type}/{b.p1:02x}/{b.p2:02x}"
                         for i, b in enumerate(p.buttons))
     return (f"polling={p.polling} sleep={p.sleep_seconds} "
+            f"light={p.light_mode} "
             f"active={p.dpi_active} count={p.dpi_count} "
             f"dpi=[{dpi}] buttons=[{buttons}]")
 
@@ -588,8 +607,8 @@ class Sc360seWindow(Gtk.ApplicationWindow):
 
         led_chk = Gtk.CheckButton(label="LED")
         led_chk.set_tooltip_text(
-            "Store this stage's DPI color flag. Static LED mode is restored "
-            "separately after device writes.")
+            "Store this stage's DPI color flag. The light-mode command is "
+            "sent separately for LED experiments.")
         def on_led(_w):
             if not self._guard:
                 self.profile.stages[i].flag = 0xff if led_chk.get_active() else 0x00
@@ -721,6 +740,21 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         polling_row.append(self.polling_combo)
         box.append(polling_row)
 
+        light_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        light_row.append(Gtk.Label(label="Light effect:"))
+        self.light_combo = Gtk.DropDown.new_from_strings(
+            [label for _, label in LIGHT_MODES])
+        self.light_combo.set_tooltip_text(
+            "Switch the 0x06/0x05 DPI light mode. Labels follow the XML names; "
+            "ACK/readback does not guarantee visible LED behavior.")
+        self.light_combo.connect("notify::selected",
+            lambda *_: (self._sync_field(
+                            "light_mode",
+                            LIGHT_MODES[self.light_combo.get_selected()][0]),
+                        self._write_light_mode() if not self._guard else None))
+        light_row.append(self.light_combo)
+        box.append(light_row)
+
         sleep_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         sleep_row.append(Gtk.Label(label="Sleep timeout (s):"))
         self.sleep_spin = Gtk.SpinButton.new_with_range(0, 65535, 30)
@@ -832,6 +866,9 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                 self.polling_combo.set_selected(POLLING_RATES.index(self.profile.polling))
             except ValueError:
                 self.polling_combo.set_selected(POLLING_RATES.index(1000))
+            light_idx = next((i for i, (mode, _) in enumerate(LIGHT_MODES)
+                              if mode == self.profile.light_mode), 1)
+            self.light_combo.set_selected(light_idx)
             # sleep
             self.sleep_spin.set_value(self.profile.sleep_seconds)
             # dpi
@@ -1102,6 +1139,23 @@ class Sc360seWindow(Gtk.ApplicationWindow):
                     pass
             self._watch_proc = None
 
+    def _run_write_commands(self, commands):
+        was_watching = getattr(self, "_watch_proc", None) is not None
+        if was_watching:
+            debug("watch: pausing for foreground write")
+            self._stop_watch()
+        try:
+            for args, timeout in commands:
+                run_cli(self.cli, *args, timeout=timeout)
+        finally:
+            if was_watching:
+                debug("watch: restarting after foreground write")
+                GLib.timeout_add(150, self._restart_watch_after_write)
+
+    def _restart_watch_after_write(self):
+        self._start_watch()
+        return False
+
     def _on_close(self, *_):
         self._stop_watch()
         return False  # let default handler destroy the window
@@ -1133,8 +1187,10 @@ class Sc360seWindow(Gtk.ApplicationWindow):
         for s in p.stages:
             parts.append(f"{s.x_cpi}/{s.y_cpi}")
         debug("WRITE dpi: " + " ".join(parts))
-        run_cli(self.cli, "dpi", *parts, timeout=5)
-        run_cli(self.cli, "static-light")
+        self._run_write_commands([
+            (("dpi", *parts), 5),
+            (self._light_mode_command(), 5),
+        ])
 
     def _write_colors(self):
         if not self._write_allowed("colors"):
@@ -1145,8 +1201,10 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             r, g, b = rgb_hex_to_tuple(s.rgb)
             parts.append(f"{r:02x}/{g:02x}/{b:02x}/{s.flag:02x}")
         debug("WRITE colors: " + " ".join(parts))
-        run_cli(self.cli, "write-colors", *parts, timeout=5)
-        run_cli(self.cli, "static-light")
+        self._run_write_commands([
+            (("write-colors", *parts), 5),
+            (self._light_mode_command(), 5),
+        ])
 
     def _write_buttons(self):
         if not self._write_allowed("buttons"):
@@ -1156,22 +1214,40 @@ class Sc360seWindow(Gtk.ApplicationWindow):
             tc = ACTION_TYPE_CODE.get(b.type, 0)
             parts.append(f"{tc:02x}/{b.p1:02x}/{b.p2:02x}")
         debug("WRITE buttons: " + " ".join(parts))
-        run_cli(self.cli, "write-buttons", *parts, timeout=5)
-        run_cli(self.cli, "static-light")
+        self._run_write_commands([
+            (("write-buttons", *parts), 5),
+            (self._light_mode_command(), 5),
+        ])
 
     def _write_polling(self):
         if not self._write_allowed("polling"):
             return
         debug(f"WRITE polling: {self.profile.polling}")
-        run_cli(self.cli, "polling", str(self.profile.polling))
-        run_cli(self.cli, "static-light")
+        self._run_write_commands([
+            (("polling", str(self.profile.polling)), 5),
+            (self._light_mode_command(), 5),
+        ])
+
+    def _write_light_mode(self):
+        if not self._write_allowed("light-mode"):
+            return
+        debug(f"WRITE light-mode: {self.profile.light_mode}")
+        self._run_write_commands([
+            (self._light_mode_command(), 5),
+        ])
 
     def _write_sleep(self):
         if not self._write_allowed("sleep"):
             return
         debug(f"WRITE sleep: {self.profile.sleep_seconds}")
-        run_cli(self.cli, "sleep", str(self.profile.sleep_seconds))
-        run_cli(self.cli, "static-light")
+        self._run_write_commands([
+            (("sleep", str(self.profile.sleep_seconds)), 5),
+            (self._light_mode_command(), 5),
+        ])
+
+    def _light_mode_command(self):
+        mode = self.profile.light_mode if 1 <= self.profile.light_mode <= 6 else 2
+        return ("light-mode", str(mode))
 
     def do_factory_reset(self):
         dlg = Gtk.AlertDialog()
